@@ -533,8 +533,9 @@ static BAProxy *BABackend = nil;
 
     long long chunk = (long long)BAChunkMB() * 1024 * 1024;
     NSInteger nseg = (NSInteger)((total + chunk - 1) / chunk);
-    NSData **buffers = (NSData **)calloc((size_t)nseg, sizeof(NSData *));
-    if (!buffers) return nil;
+    // ARC 下不能用 calloc 裸指针放 ObjC 对象，改用 NSMutableArray（占位 NSNull）
+    NSMutableArray<NSData *> *buffers = [NSMutableArray arrayWithCapacity:(NSUInteger)nseg];
+    for (NSInteger i = 0; i < nseg; i++) [buffers addObject:[NSNull null]];
     dispatch_group_t group = dispatch_group_create();
     dispatch_queue_t laneQ = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     __block BOOL failed = NO;
@@ -546,7 +547,7 @@ static BAProxy *BABackend = nil;
         dispatch_async(laneQ, ^{
             NSData *part = [self fetchRange:real from:from to:to lane:idx];
             if (part) {
-                buffers[idx] = part;
+                @synchronized (buffers) { buffers[idx] = part; }
             } else {
                 failed = YES;
             }
@@ -556,16 +557,12 @@ static BAProxy *BABackend = nil;
     dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
 
     if (failed) {
-        for (NSInteger i = 0; i < nseg; i++) [buffers[i] release];
-        free(buffers);
         return nil;   // 任一分段失败 → 502，播放器自动 failover 到 backupUrl
     }
     NSMutableData *all = [NSMutableData dataWithCapacity:(NSUInteger)total];
     for (NSInteger i = 0; i < nseg; i++) {
         [all appendData:buffers[i]];
-        [buffers[i] release];
     }
-    free(buffers);
     return all;
 }
 
@@ -744,7 +741,7 @@ static void BiliAccInit(void) {
         Method m = class_getInstanceMethod([NSURLSession class],
                                            @selector(dataTaskWithRequest:completionHandler:));
         if (m) {
-            BAOrigDataTask = (void (*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))
+            BAOrigDataTask = (NSURLSessionDataTask * (*)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)))
                 method_getImplementation(m);
             method_setImplementation(m, (IMP)BAHookDataTask);
         }
