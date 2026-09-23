@@ -63,10 +63,13 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.0
+          tag_name: v0.2.0
           files: build/BiliAccelerator.dylib
           fail_on_unmatched_files: true
           body: |
-            BiliAccelerator.dylib v0.1.0
-            - arm64 iOS 13+ 免越狱注入 dylib
-            - 用 tools/repack.py 注入到脱壳 IPA
+            BiliAccelerator.dylib v0.2.0
+            - 修复 B 站全局 NSURLProtocol 劫持代理上游（根本原因之一）
+            - Content-Range 带真实总长度（IJKPlayer 资产重启循环根因）
+            - 多路并发窗口阈值 1MB -> 384KB（普通视频也吃到 6 路并发）
+            - 主机失效切换（上游失败自动换镜像重试）+ 15s 快速超时
+            - 文件日志 tmp/BiliAcc.log（devicectl 可直接拉取）

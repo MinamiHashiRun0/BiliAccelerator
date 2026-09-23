@@ -904,8 +904,9 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
 
     long long windowSize = reqTo - reqFrom + 1;
     NSInteger lanes = (NSInteger)BAConcurrency();
-    // 窗口小于 1MB 时并发无意义（握手开销 > 收益），单连接直接拉
-    if (windowSize < 1024 * 1024 || lanes <= 1) {
+    // 窗口小于 384KB 时并发意义有限（握手开销占比升高），单连接直接拉；
+    // 384KB 起 6 路均分后每片 >= 64KB，仍显著优于单路
+    if (windowSize < 384 * 1024 || lanes <= 1) {
         BAEssentialLog(@"seg: window %lld-%lld (%lldKB) single connection",
               reqFrom, reqTo, windowSize / 1024);
         NSData *body = [self fetchRange:real from:reqFrom to:reqTo lane:0];
