@@ -583,7 +583,9 @@ static void BASchemaClassify(uint32_t field, NSData *value, BAFieldAction *act, 
             }
             break;
     }
-    if (childLevel >= 0 && act->action == 2) {
+    if (childLevel >= 0) {
+        // 关键：激活递归分支（此前遗漏 —— action 恒 0 导致 protobuf 路径整体失效）
+        act->action = 2;
         // 递归前：保存当前层，切到子层。BASerializeMessage 的 action=2 分支
         // 递归返回后会用 savedLevel 恢复本层，保证兄弟字段层级正确。
         ctx->savedLevel = ctx->level;

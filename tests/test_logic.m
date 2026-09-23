@@ -4,6 +4,7 @@
 
 #import <Foundation/Foundation.h>
 #import <stdio.h>
+#import "wirecheck.m"
 #import "../src/Tweak.m"
 
 static int g_pass = 0, g_fail = 0;
@@ -11,6 +12,51 @@ static int g_pass = 0, g_fail = 0;
     if (cond) { g_pass++; printf("PASS  %s\n", name); } \
     else { g_fail++; printf("FAIL  %s\n", name); } \
 } while (0)
+
+// 提取 message 中第一个匹配 field 的 LEN 字段字节
+static NSData *WCExtractField(NSData *msg, uint32_t wantField) {
+    const uint8_t *b = msg.bytes;
+    NSUInteger len = msg.length, i = 0;
+    while (i < len) {
+        uint64_t tag = 0;
+        NSUInteger shift = 0, tl = 0;
+        while (i + tl < len && shift < 63) {
+            uint8_t c = b[i + tl++];
+            tag |= (uint64_t)(c & 0x7f) << shift;
+            if (!(c & 0x80)) break;
+            shift += 7;
+        }
+        i += tl;
+        uint32_t field = (uint32_t)(tag >> 3), wt = (uint32_t)(tag & 7);
+        if (wt == 2) {
+            uint64_t flen = 0;
+            NSUInteger fl = 0; shift = 0;
+            while (i + fl < len && shift < 63) {
+                uint8_t c = b[i + fl++];
+                flen |= (uint64_t)(c & 0x7f) << shift;
+                if (!(c & 0x80)) break;
+                shift += 7;
+            }
+            i += fl;
+            if (field == wantField) {
+                return [msg subdataWithRange:NSMakeRange(i, (NSUInteger)MIN((uint64_t)(len - i), flen))];
+            }
+            i += (NSUInteger)flen;
+        } else if (wt == 0) {
+            while (i < len && (b[i] & 0x80)) i++;
+            i++;
+        } else if (wt == 1) i += 8;
+        else if (wt == 5) i += 4;
+        else return nil;
+    }
+    return nil;
+}
+
+static NSString *WCExtractString(NSData *msg, uint32_t field) {
+    NSData *v = WCExtractField(msg, field);
+    if (!v) return nil;
+    return [[NSString alloc] initWithData:v encoding:NSUTF8StringEncoding];
+}
 
 // ---- protobuf wire 构造 helper ----
 static void pv(NSMutableData *d, NSUInteger v) {
@@ -94,25 +140,31 @@ int main(void) {
         BOOL changed = NO;
         NSData *out = BARewriteProtobufBody(top, &changed);
         CHECK(changed, "protobuf: rewrite reported change");
+        CHECK(out != nil && out.length > 0, "protobuf: output non-empty");
 
-        NSString *outStr = [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding];
-        CHECK([outStr containsString:@"http://127.0.0.1"],
-              "protobuf: video URL routed to local proxy");
-        CHECK(![outStr containsString:@"123.45.67.89"],
-              "protobuf: PCDN host eliminated");
-        CHECK([outStr containsString:@"30216.m4s"] && [outStr containsString:@"upos-sz-mirrorcos"],
-              "protobuf: audio stream host preserved verbatim");
-        // 音频部分不应被包代理：音频 URL 之后不应再出现 127.0.0.1
-        NSRange audioLoc = [outStr rangeOfString:@"30216.m4s"];
-        BOOL audioProxied = NO;
-        if (audioLoc.location != NSNotFound) {
-            NSRange tail = [outStr rangeOfString:@"127.0.0.1" options:0 range:NSMakeRange(audioLoc.location, outStr.length - audioLoc.location)];
-            audioProxied = tail.location != NSNotFound;
-        }
-        CHECK(!audioProxied, "protobuf: audio NOT wrapped in proxy");
+        // 结构化断言（wire 解析，不用字符串嗅探）：
+        NSData *outVod = WCExtractField(out, 1);
+        CHECK(outVod != nil, "wire: VodInfo field intact");
+        NSData *outStream = outVod ? WCExtractField(outVod, 5) : nil;
+        NSData *outAudioSub = outVod ? WCExtractField(outVod, 6) : nil;
+        CHECK(outStream != nil, "protobuf: stream_list intact");
+        CHECK(outAudioSub != nil, "protobuf: dash_audio intact");
 
-        // 改写后的 protobuf 仍需是合法 wire 格式（round-trip 解析）：
-        // 重新用 BARewriteProtobufBody 处理输出——幂等（已改写内容不变）
+        NSData *outDashVideo = outStream ? WCExtractField(outStream, 2) : nil;
+        NSString *videoBase = outDashVideo ? WCExtractString(outDashVideo, 1) : nil;
+        NSString *videoBackup = outDashVideo ? WCExtractString(outDashVideo, 2) : nil;
+        CHECK([videoBase hasPrefix:@"http://127.0.0.1"],
+              "protobuf: video base_url routed to local proxy");
+        CHECK([videoBase containsString:@"30064.m4s"],
+              "protobuf: video path preserved");
+        CHECK([videoBackup hasPrefix:@"http://127.0.0.1"],
+              "protobuf: video backup_url also proxied");
+
+        NSString *audioBase = outAudioSub ? WCExtractString(outAudioSub, 2) : nil;
+        CHECK([audioBase isEqualToString:@"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/ab/ab/cid/30216.m4s?a=1"],
+              "protobuf: audio base_url byte-identical (unwrapped, untouched)");
+
+        // 幂等：已改写输出再处理应无变化
         BOOL changed2 = NO;
         NSData *out2 = BARewriteProtobufBody(out, &changed2);
         CHECK(!changed2, "protobuf: rewrite idempotent");
@@ -130,14 +182,16 @@ int main(void) {
         BOOL jch = NO;
         NSString *jout = BARewriteJsonPayload(json, &jch);
         CHECK(jch, "json: rewrite triggered");
-        CHECK([jout containsString:@"http://127.0.0.1"],
+
+        NSDictionary *jroot = [NSJSONSerialization JSONObjectWithData:
+            [jout dataUsingEncoding:NSUTF8StringEncoding] options:0 error:NULL];
+        NSDictionary *dash = jroot[@"data"][@"dash"];
+        NSString *vUrl = dash[@"video"][0][@"baseUrl"];
+        NSString *aUrl = dash[@"audio"][0][@"baseUrl"];
+        CHECK([vUrl hasPrefix:@"http://127.0.0.1"],
               "json: video URL proxied");
-        NSRange aJ = [jout rangeOfString:@"30216.m4s"];
-        CHECK(aJ.location != NSNotFound, "json: audio present");
-        if (aJ.location != NSNotFound) {
-            NSRange tail = [jout rangeOfString:@"127.0.0.1" options:0 range:NSMakeRange(aJ.location, jout.length - aJ.location)];
-            CHECK(tail.location == NSNotFound, "json: audio NOT wrapped in proxy");
-        }
+        CHECK([aUrl isEqualToString:@"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/83/04/30216.m4s"],
+              "json: audio URL byte-identical");
 
         printf("\nRESULT: %d passed, %d failed\n", g_pass, g_fail);
         return g_fail == 0 ? 0 : 1;
