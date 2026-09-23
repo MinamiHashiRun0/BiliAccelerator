@@ -89,7 +89,8 @@ def main():
         injected = tmp / "injected_binary"
         subprocess.run(
             [sys.executable, str(here / "inject_dylib.py"),
-             "-i", str(exe), "-o", str(injected)],
+             "-i", str(exe), "-o", str(injected),
+             "--dylib", f"@executable_path/Frameworks/{dylib.name}"],
             check=True,
         )
         shutil.copy2(injected, exe)

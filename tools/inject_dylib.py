@@ -32,16 +32,23 @@ def find_inject_point(data):
     header_size = 32
     return header_size + sizeofcmds, ncmds
 
-def make_load_weak_dylib(rpath="@rpath/BiliAccelerator.dylib"):
-    path_b = rpath.encode() + b"\x00"
-    # dylib 命令结构: cmd(4) cmdsize(4) name offset(4) timestamp(4) current_version(4)
-    #                compatibility_version(4) + name(padded)
-    cmdsize = 24 + ((len(path_b) + 3) & ~3)
-    lc = struct.pack("<II", LC_LOAD_WEAK_DYLIB, cmdsize)
-    lc += struct.pack("<III", 0, 0, 0)       # name offset后紧跟 timestamp/current/compat — 实际 name_offset=24
-    lc += path_b + b"\x00" * (cmdsize - 24 - len(path_b))
-    # 修正 name 偏移（结构里 name offset 在第 3 个字段）
-    lc = lc[:8] + struct.pack("<I", 24) + lc[12:]
+def make_load_weak_dylib(dylib_path="@executable_path/Frameworks/BiliAccelerator.dylib"):
+    """构造 dylib_command (LC_LOAD_WEAK_DYLIB)。
+    结构: cmd(4) cmdsize(4) name.offset(4) timestamp(4) current_version(4)
+          compatibility_version(4) + name 字符串(补齐到 4 字节)
+    name.offset 恒为 24（6 个 4 字节头字段之后）。"""
+    path_b = dylib_path.encode() + b"\x00"
+    padded = (len(path_b) + 3) & ~3
+    cmdsize = 24 + padded
+    lc = struct.pack("<IIIIII",
+                     LC_LOAD_WEAK_DYLIB,   # cmd
+                     cmdsize,              # cmdsize
+                     24,                   # name.offset —— 字符串紧跟 24 字节头
+                     0,                    # timestamp
+                     0,                    # current_version
+                     0)                    # compatibility_version
+    lc += path_b + b"\x00" * (padded - len(path_b))
+    assert len(lc) == cmdsize, "dylib_command size mismatch"
     return lc
 
 def inject(data, dylib_path="@rpath/BiliAccelerator.dylib"):
@@ -59,7 +66,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-i", "--input", required=True)
     ap.add_argument("-o", "--output", required=True)
-    ap.add_argument("--dylib", default="@rpath/BiliAccelerator.dylib")
+    ap.add_argument("--dylib", default="@executable_path/Frameworks/BiliAccelerator.dylib")
     args = ap.parse_args()
     with open(args.input, "rb") as f:
         data = f.read()

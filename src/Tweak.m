@@ -96,6 +96,13 @@ static NSInteger BAProxyPort(void) {     // 本地代理端口
     return BAQueryInt(@"BiliAcc_proxyPort", 54321, 1024, 65535);
 }
 
+// 详细日志开关：默认关；YES 时逐条打印每次改写/代理请求
+static BOOL BAVerbose(void) {
+    return BAQueryBool(@"BiliAcc_verbose", NO);
+}
+
+#define BALog(...) do { if (BAVerbose()) NSLog(@"[BiliAcc] " __VA_ARGS__); } while (0)
+
 // WebSocket/HTTP 代理器（如代理软件）会把 127.0.0.1 流量直连，不会重复加速
 #pragma mark - 工具函数
 
@@ -279,6 +286,9 @@ static void BARewriteDashContainer(NSDictionary *container, BOOL *changed) {
                     NSString *reason = nil;
                     NSString *next = BARewriteUrlDetail(val, &reason);
                     if (![next isEqualToString:val]) {
+                        BALog(@"json-rewrite [%@] %@: %@ → %@", kind, reason,
+                              [val substringToIndex:MIN((NSUInteger)120, val.length)],
+                              [next substringToIndex:MIN((NSUInteger)120, next.length)]);
                         entry[key] = next;
                         *changed = YES;
                     }
@@ -288,6 +298,7 @@ static void BARewriteDashContainer(NSDictionary *container, BOOL *changed) {
                             (long)BAProxyPort(),
                             [next stringByAddingPercentEncodingWithAllowedCharacters:
                                        [[NSCharacterSet alphanumericCharacterSet] invertedSet]]];
+                        BALog(@"video → local proxy (lanes=%ld)", (long)BAConcurrency());
                         *changed = YES;
                     }
                 }
@@ -396,6 +407,9 @@ static NSData *BARewriteProtobufBody(NSData *data, BOOL *changed) {
             NSString *reason = nil;
             NSString *next = BARewriteUrlDetail(str, &reason);
             if ([next isEqualToString:str]) continue;
+            BALog(@"pb-rewrite [%@] %@ → %@", reason,
+                  [str substringToIndex:MIN((NSUInteger)120, str.length)],
+                  [next substringToIndex:MIN((NSUInteger)120, next.length)]);
 
             // 保留 lpos 之前字节，重建 varint 长度前缀 + 新 URL 内容
             [out appendBytes:b + i length:lpos - i];
@@ -503,6 +517,8 @@ static BAProxy *BABackend = nil;
         dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * NSEC_PER_SEC));
         long long expect = to - from + 1;
         if (d && (long long)d.length == expect) return d;
+        BALog(@"lane %ld attempt %ld range %lld-%lld got %zu bytes (expect %lld)",
+              (long)lane, (long)attempt, from, to, d ? d.length : 0, expect);
     }
     return nil;
 }
@@ -516,8 +532,10 @@ static BAProxy *BABackend = nil;
     if (!real) return nil;
 
     long long total = [self probeTotalSize:real];
+    BALog(@"seg proxy: total=%lld host=%@", total, real.host);
     if (total <= 0) {
         // CDN 不支持 Range/HEAD → 单连接全量下载兜底
+        BALog(@"Range probe failed, falling back to single connection");
         NSMutableURLRequest *one = [NSMutableURLRequest requestWithURL:real];
         one.timeoutInterval = 30;
         __block NSData *body = nil;
@@ -533,6 +551,8 @@ static BAProxy *BABackend = nil;
 
     long long chunk = (long long)BAChunkMB() * 1024 * 1024;
     NSInteger nseg = (NSInteger)((total + chunk - 1) / chunk);
+    BALog(@"fan-out: %ld segments × %ldMB, lanes=%ld",
+          (long)nseg, (long)BAChunkMB(), (long)BAConcurrency());
     // ARC 下不能用 calloc 裸指针放 ObjC 对象，改用 NSMutableArray（占位 NSNull）
     NSMutableArray<NSData *> *buffers = [NSMutableArray arrayWithCapacity:(NSUInteger)nseg];
     for (NSInteger i = 0; i < nseg; i++) [buffers addObject:[NSNull null]];
@@ -730,10 +750,16 @@ static NSURLSessionDataTask *BAHookDataTask(id self, SEL _cmd, NSURLRequest *req
 
 #pragma mark - 入口
 
+// constructor 里不能用 BAQuery*（它们依赖 ObjC runtime 完全就绪的时序没问题，
+// 但为了诊断加载失败，先用 C 接口直接读一次 enabled）
 __attribute__((constructor))
 static void BiliAccInit(void) {
     @autoreleasepool {
-        if (!BAEnabled()) return;
+        NSLog(@"[BiliAcc] dylib constructor entered (build %s)", __DATE__ " " __TIME__);
+        if (!BAEnabled()) {
+            NSLog(@"[BiliAcc] disabled via BiliAcc_enabled, exiting");
+            return;
+        }
         BABackend = [BAProxy new];
         BAStartLocalServer(BAProxyPort());
 
@@ -745,8 +771,8 @@ static void BiliAccInit(void) {
                 method_getImplementation(m);
             method_setImplementation(m, (IMP)BAHookDataTask);
         }
-        NSLog(@"[BiliAcc] loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld",
-              (long)BAProxyPort(), BAMode(), BATargetHost(), (long)BAConcurrency());
+        NSLog(@"[BiliAcc] loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld, verbose=%d",
+              (long)BAProxyPort(), BAMode(), BATargetHost(), (long)BAConcurrency(), BAVerbose());
     }
 }
 
