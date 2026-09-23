@@ -1086,7 +1086,7 @@ static void BARewriteVideoInfo(id videoInfo) {
 }
 
 // 拦截 PlayViewUniteReply 反序列化
-static void (*BAOrigPVUInit)(id, SEL, id, id, id *);
+static id (*BAOrigPVUInit)(id, SEL, id, id, id *);
 static id BAHookPVUInit(id self, SEL _cmd, id data, id registry, id *error) {
     id ret = BAOrigPVUInit(self, _cmd, data, registry, error);
     if (BAEnabled() && ret) {
@@ -1101,7 +1101,7 @@ static id BAHookPVUInit(id self, SEL _cmd, id data, id registry, id *error) {
 }
 
 // 拦截 PlayViewReply（老接口）反序列化
-static void (*BAOrigPVInit)(id, SEL, id, id, id *);
+static id (*BAOrigPVInit)(id, SEL, id, id, id *);
 static id BAHookPVInit(id self, SEL _cmd, id data, id registry, id *error) {
     id ret = BAOrigPVInit(self, _cmd, data, registry, error);
     if (BAEnabled() && ret) {
