@@ -1140,7 +1140,7 @@ static void BAHookGrpcModels(void) {
     if (pvu) {
         Method m = class_getInstanceMethod(pvu, sel);
         if (m) {
-            BAOrigPVUInit = (void (*)(id, SEL, id, id, id *))method_getImplementation(m);
+            BAOrigPVUInit = (id (*)(id, SEL, id, id, id *))method_getImplementation(m);
             method_setImplementation(m, (IMP)BAHookPVUInit);
             NSLog(@"[BiliAcc] hooked PlayViewUniteReply initWithData");
         }
@@ -1156,7 +1156,7 @@ static void BAHookGrpcModels(void) {
     if (pv) {
         Method m = class_getInstanceMethod(pv, sel);
         if (m) {
-            BAOrigPVInit = (void (*)(id, SEL, id, id, id *))method_getImplementation(m);
+            BAOrigPVInit = (id (*)(id, SEL, id, id, id *))method_getImplementation(m);
             method_setImplementation(m, (IMP)BAHookPVInit);
             NSLog(@"[BiliAcc] hooked PlayViewReply initWithData");
         }
