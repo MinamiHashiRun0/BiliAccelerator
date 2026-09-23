@@ -810,7 +810,7 @@ static void BAServeConnection(int conn) {
         if (parts.count < 2) { close(conn); return; }
 
         NSString *path = parts[1];
-        BAEssentialLog(@"conn: %{public}@", path);
+        BAEssentialLog(@"conn: %{public}s", path.UTF8String);
         NSURL *abs = [NSURL URLWithString:[@"http://127.0.0.1" stringByAppendingString:path]];
         NSURL *inner = [BABackend innerURLFor:abs.query ?: @""];
 
@@ -832,8 +832,8 @@ static void BAServeConnection(int conn) {
 
         NSData *body = nil;
         if ([path hasPrefix:@"/seg"]) {
-            BAEssentialLog(@"seg req: Range=%{public}@ (from=%lld to=%lld)",
-                rangeHeader ?: @"(none)", reqFrom, reqTo);
+            BAEssentialLog(@"seg req: Range=%{public}s (from=%lld to=%lld)",
+                (rangeHeader ?: @"(none)").UTF8String, reqFrom, reqTo);
             body = [BABackend handleVideoSegment:inner reqFrom:reqFrom reqTo:reqTo
                                         rangeReq:rangeReq error:NULL];
         } else if ([path hasPrefix:@"/play"]) {
@@ -1168,8 +1168,10 @@ static void BADeepRewrite(id obj, NSString *keyPath, int depth, NSMutableSet *se
                     @try {
                         [obj setValue:next forKey:pname];
                         NSString *ns = (NSString *)next;
-                        BAEssentialLog(@"rt-rewrite %{public}@: %{public}@",
-                            childPath, [ns substringToIndex:MIN((NSUInteger)90, ns.length)]);
+                        NSString *pv = [ns length] > 90 ? [ns substringToIndex:90] : ns;
+                        BAEssentialLog(@"rt-rewrite %{public}s: %{public}s",
+                            childPath ? childPath.UTF8String : "(nil)",
+                            pv.UTF8String ?: "");
                     } @catch (NSException *e) { (void)e; }
                 }
             } else if ([val isKindOfClass:[NSArray class]] ||
@@ -1216,7 +1218,7 @@ static Class BAFindReplyClass(NSArray<NSString *> *candidates) {
     for (NSString *name in candidates) {
         Class c = objc_getClass(name.UTF8String);
         if (c) {
-            NSLog(@"[BiliAcc] found reply class: %{public}@", name);
+            NSLog(@"[BiliAcc] found reply class: %{public}s", name.UTF8String);
             return c;
         }
     }
@@ -1269,7 +1271,7 @@ static void BAHookGrpcModels(void) {
             }
         }
         free(classes);
-        NSLog(@"[BiliAcc] no known reply class found; candidates: %{public}@", hits);
+        NSLog(@"[BiliAcc] no known reply class found; candidates: %{public}s", hits.description.UTF8String);
     }
 }
 
