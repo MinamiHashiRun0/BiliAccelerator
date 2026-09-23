@@ -8,6 +8,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <stdlib.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
@@ -55,19 +56,32 @@ static NSArray<NSString *> *BAKnownP2PHosts(void) {
 
 #pragma mark - 配置
 
+// 优先级：环境变量 > CFPreferences（App 内偏好）> 默认值。
+// 环境变量仅用于 Mac 直跑/调试时免重签快速调参：BiliAcc_mode=force ...
+static NSString *BAEnvOverride(NSString *key) {
+    const char *e = getenv(key.UTF8String);
+    return e ? [NSString stringWithUTF8String:e] : nil;
+}
+
 static BOOL BAQueryBool(NSString *key, BOOL dflt) {
+    NSString *env = BAEnvOverride(key);
+    if (env) return [env boolValue];
     id v = CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)kDomain));
     return [v isKindOfClass:[NSNumber class]] ? [(NSNumber *)v boolValue] : dflt;
 }
 
 static NSString *BAQueryString(NSString *key, NSString *dflt) {
+    NSString *env = BAEnvOverride(key);
+    if (env) return env;
     id v = CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)kDomain));
     return [v isKindOfClass:[NSString class]] ? v : dflt;
 }
 
 static NSInteger BAQueryInt(NSString *key, NSInteger dflt, NSInteger min, NSInteger max) {
-    id v = CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)kDomain));
-    NSInteger n = [v isKindOfClass:[NSNumber class]] ? [(NSNumber *)v integerValue] : dflt;
+    NSString *env = BAEnvOverride(key);
+    id v = env ?: CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)kDomain));
+    NSInteger n = [v isKindOfClass:[NSNumber class]] ? [(NSNumber *)v integerValue]
+                : ([v isKindOfClass:[NSString class]] ? [v integerValue] : dflt);
     return MAX(min, MIN(max, n));
 }
 
@@ -232,6 +246,27 @@ static NSString *BAReplaceHost(NSURL *url, NSString *newHost) {
     return c.URL.absoluteString;
 }
 
+// RFC3986 unreserved：保留 . ~ - _（路径可读、断言可命中），其余照旧转义
+static NSString *BAQueryParamEncode(NSString *s) {
+    static NSCharacterSet *allowed;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableCharacterSet *a = [[NSCharacterSet alphanumericCharacterSet] mutableCopy];
+        [a addCharactersInString:@"-._~"];
+        allowed = a;
+    });
+    return [s stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+}
+
+// 改写结果包装进本地并发代理。已指向 127.0.0.1 的输入原样返回（幂等）。
+// 并发路数 >1 才包装；单路时直连改写结果即可。
+static NSString *BAWrapProxy(NSString *next) {
+    if (!next || [next hasPrefix:@"http://127.0.0.1"]) return next;
+    if (BAConcurrency() <= 1) return next;
+    return [NSString stringWithFormat:@"http://127.0.0.1:%ld/seg?u=%@",
+        (long)BAProxyPort(), BAQueryParamEncode(next)];
+}
+
 // 单个 URL 的改写决策。reason: cdn-host / pcdn-host / mcdn-proxy / szbdyd-source / live-skip / ok
 static NSString *BARewriteUrlDetail(NSString *rawUrl, NSString **reason) {
     NSString *noop = rawUrl;
@@ -258,9 +293,7 @@ static NSString *BARewriteUrlDetail(NSString *rawUrl, NSString **reason) {
     if (v.isMcdn) {
         if (reason) *reason = @"mcdn-proxy";
         return [NSString stringWithFormat:@"http://127.0.0.1:%ld/play?u=%@",
-                (long)BAProxyPort(),
-                [url.absoluteString stringByAddingPercentEncodingWithAllowedCharacters:
-                           [[NSCharacterSet alphanumericCharacterSet] invertedSet]]];
+                (long)BAProxyPort(), BAQueryParamEncode(url.absoluteString)];
     }
 
     BOOL force = [BAMode() isEqualToString:@"force"];
@@ -382,15 +415,17 @@ static void BARewriteDashContainer(NSDictionary *container, BOOL *changed) {
 // 字段号是唯一的寻址方式，不再做 "http" 字符串盲扫——盲扫无法区分
 // VideoInfo 里分离的 video/audio，两代 proto 字段号也不同。
 
-static NSUInteger BAReadVarint(const uint8_t *b, NSUInteger len, NSUInteger *outLen) {
-    NSUInteger v = 0, shift = 0, i = 0;
+// 返回消费的字节数；解析出的值写入 *outValue
+static NSUInteger BAReadVarint(const uint8_t *b, NSUInteger len, uint64_t *outValue) {
+    uint64_t v = 0;
+    NSUInteger shift = 0, i = 0;
     while (i < len && shift < 63) {
         uint8_t c = b[i++];
-        v |= (NSUInteger)(c & 0x7f) << shift;
+        v |= (uint64_t)(c & 0x7f) << shift;
         if (!(c & 0x80)) break;
         shift += 7;
     }
-    *outLen = v;
+    *outValue = v;
     return i;
 }
 
@@ -466,6 +501,7 @@ static void BASerializeMessage(NSData *data, NSUInteger start, NSUInteger end,
                 NSUInteger fl = BAReadVarint(b + i, end - i, &flen);
                 if (fl == 0 || i + fl + flen > end) { [out appendBytes:b+tagStart length:end-i]; return; }
                 fieldEnd = i + fl + (NSUInteger)flen;
+                valueStart = i + fl;   // 值起点在长度前缀之后（此前误指长度字节，递归子树整体错位）
                 break;
             }
             default:
@@ -515,6 +551,7 @@ static void BARewriteUrlField(NSData *fieldValue, BAFieldAction *act, BAWalkCtx 
     if (!str || ![str hasPrefix:@"http"]) return;
     NSString *reason = nil;
     NSString *next = BARewriteUrlDetail(str, &reason);
+    next = BAWrapProxy(next);   // 视频 URL 进本地并发代理（与运行时路径同语义）
     if ([next isEqualToString:str]) return;
     BALog(@"pb-rewrite %s [%@] → %@", what, reason ?: @"?",
           [next substringToIndex:MIN((NSUInteger)100, next.length)]);
@@ -1187,14 +1224,7 @@ static id BARewriteMediaValue(id val) {
     if (!u || !BAIsMediaURL(u) || BAIsLiveMedia(u)) return nil;
     if ([s hasPrefix:@"http://127.0.0.1"]) return nil;
     NSString *reason = nil;
-    NSString *next = BARewriteUrlDetail(s, &reason);
-    // 并发代理包装
-    if (BAConcurrency() > 1 && ![next hasPrefix:@"http://127.0.0.1"]) {
-        next = [NSString stringWithFormat:@"http://127.0.0.1:%ld/seg?u=%@",
-            (long)BAProxyPort(),
-            [next stringByAddingPercentEncodingWithAllowedCharacters:
-                       [[NSCharacterSet alphanumericCharacterSet] invertedSet]]];
-    }
+    NSString *next = BAWrapProxy(BARewriteUrlDetail(s, &reason));
     if ([next isEqualToString:s]) return nil;
     return next;
 }

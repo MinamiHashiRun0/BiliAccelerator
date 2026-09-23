@@ -20,20 +20,21 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-MH_CIGAM_64 = 0xCFaFEDFe
+MH_MAGIC_64 = 0xFEEDFACF  # 小端读取字节 cf fa ed fe
 LC_ENCRYPTION_INFO = 0x2C  # LC_ENCRYPTION_INFO_64
 
 
 def is_encrypted(binary: bytes) -> bool:
     magic = struct.unpack_from("<I", binary, 0)[0]
-    if magic != MH_CIGAM_64:
+    if magic != MH_MAGIC_64:
         raise SystemExit("主二进制不是 arm64 little-endian Mach-O —— 请确认 IPA 已脱壳")
     ncmds = struct.unpack_from("<I", binary, 16)[0]
     off = 32
     for _ in range(ncmds):
         cmd, size = struct.unpack_from("<II", binary, off)
         if cmd == LC_ENCRYPTION_INFO:
-            cryptid = struct.unpack_from("<I", binary, off + 8)[0]
+            # LC_ENCRYPTION_INFO_64: cmd(0) cmdsize(4) cryptoff(8) cryptsize(12) cryptid(16)
+            cryptid = struct.unpack_from("<I", binary, off + 16)[0]
             return cryptid != 0
         off += size
     return False

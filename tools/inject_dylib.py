@@ -3,34 +3,25 @@
 使 dylib 在 App 启动时自动加载（免越狱侧载/TrollStore 场景）。
 
 用法:
-  python inject_dylib.py < binaries/executable > injected_executable
   python inject_dylib.py -i binaries/executable -o injected_executable
 
-来源约定: dylib 放在 IPA 的 Applications/<App>.app/Frameworks/ 下，
-LC_LOAD_WEAK_DYLIB 使用 @rpath/BiliAccelerator.dylib，
-主程序 Info.plist 或主程序本身需要有合适的 LC_RPATH（@executable_path/Frameworks 一般已存在）。
+来源约定: dylib 放在 IPA 的 <App>.app/Frameworks/ 下，
+LC_LOAD_WEAK_DYLIB 使用 @executable_path/Frameworks/<name>.dylib。
+
+实现说明（重要）:
+  主二进制通常在 load command 表末尾之后、首个 section 数据之前有一段
+  零填充区。注入时把新 LC **原位写入**这段零区（只更新 ncmds/sizeofcmds），
+  绝不移动任何既有文件数据 —— 否则各 segment/section 的 fileoff 全部失效，
+  codesign strict validation 直接报 "main executable failed strict validation"。
+  若零区不够（罕见），报错退出而不是产生坏二进制。
 """
 import struct
 import sys
 import argparse
 
 LC_LOAD_WEAK_DYLIB = 0x18
-LC_RPATH = 0x1C | 0x80000000  # LC_RPATH with支撑位，实际值 0x1c800000
-MH_MAGIC_64 = 0xFeedFacf
-MH_CIGAM_64 = 0xCFaFEDFe
+MH_MAGIC_64 = 0xFEEDFACF  # 小端读取字节 cf fa ed fe
 
-def read_u32(data, off):
-    return struct.unpack_from("<I", data, off)[0]
-
-def find_inject_point(data):
-    """在第一个 load command 结束之后注入（把所有 LC 后移）"""
-    magic = struct.unpack_from("<I", data, 0)[0]
-    if magic != MH_CIGAM_64:
-        raise SystemExit("not a little-endian 64-bit Mach-O (input must be unencrypted iOS arm64 binary)")
-    ncmds = struct.unpack_from("<I", data, 16)[0]
-    sizeofcmds = struct.unpack_from("<I", data, 20)[0]
-    header_size = 32
-    return header_size + sizeofcmds, ncmds
 
 def make_load_weak_dylib(dylib_path="@executable_path/Frameworks/BiliAccelerator.dylib"):
     """构造 dylib_command (LC_LOAD_WEAK_DYLIB)。
@@ -51,16 +42,29 @@ def make_load_weak_dylib(dylib_path="@executable_path/Frameworks/BiliAccelerator
     assert len(lc) == cmdsize, "dylib_command size mismatch"
     return lc
 
-def inject(data, dylib_path="@rpath/BiliAccelerator.dylib"):
-    inject_off, _ = find_inject_point(data)
+
+def inject(data, dylib_path="@executable_path/Frameworks/BiliAccelerator.dylib"):
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic != MH_MAGIC_64:
+        raise SystemExit("not a little-endian 64-bit Mach-O (input must be unencrypted iOS arm64 binary)")
+    ncmds, sizeofcmds = struct.unpack_from("<II", data, 16)
+    end_lc = 32 + sizeofcmds
     lc = make_load_weak_dylib(dylib_path)
-    # 重写 ncmds 和 sizeofcmds
-    ncmds = struct.unpack_from("<I", data, 16)[0] + 1
-    sizeofcmds = struct.unpack_from("<I", data, 20)[0] + len(lc)
+
+    # 原位写入零填充区：end_lc 起必须有 >= len(lc) 的连续零
+    run = 0
+    while end_lc + run < len(data) and data[end_lc + run] == 0 and run < len(lc):
+        run += 1
+    if run < len(lc):
+        raise SystemExit(
+            f"load command 表后零填充不足（{run} < {len(lc)} 字节），"
+            "无法原位注入 —— 请勿使用移动数据的旧方案")
     out = bytearray(data)
-    struct.pack_into("<I", out, 16, ncmds)
-    struct.pack_into("<I", out, 20, sizeofcmds)
-    return bytes(out[:inject_off]) + lc + bytes(out[inject_off:])
+    out[end_lc:end_lc + len(lc)] = lc
+    struct.pack_into("<I", out, 16, ncmds + 1)
+    struct.pack_into("<I", out, 20, sizeofcmds + len(lc))
+    return bytes(out)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -74,6 +78,7 @@ def main():
     with open(args.output, "wb") as f:
         f.write(injected)
     print(f"OK: LC_LOAD_WEAK_DYLIB -> {args.dylib} injected into {args.output}")
+
 
 if __name__ == "__main__":
     main()

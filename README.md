@@ -58,6 +58,31 @@ CDN 主机判定/改写规则，做成注入 Bilibili iOS 官方客户端的 dyl
 
 推到 GitHub 之后 Actions 会自动产出 `BiliAccelerator.dylib`（arm64 iOS，ios13+）：
 
+### 本地 Mac 一键构建（推荐）
+
+有 Xcode 的 Mac 上一条命令完成：编译 dylib → 注入 IPA → 产出 Mac 直跑 App：
+
+```bash
+./tools/mac_repack.sh            # 默认 ../哔哩哔哩-弹幕番剧直播高清视频_9.12.0.ipa
+./tools/mac_repack.sh <ipa路径>   # 指定脱壳 IPA
+```
+
+产物：
+- `build/bili-universal-accelerated.ipa` — 设备侧载用（侧载工具负责重签）
+- `build/mac-run/<App>.app` — Apple Silicon Mac 直接运行用（ad-hoc 重签 + lldb 权限）
+
+**Mac 直跑调试闭环**（比模拟器快得多——模拟器无法加载设备版 IPA）：
+
+```bash
+# 直接从终端启动主二进制，环境变量即时调参（无需重签/重装）
+BiliAcc_verbose=1 BiliAcc_mode=force \
+  /Applications/bili-universal.app/bili-universal
+```
+
+配置优先级：**环境变量 > CFPreferences > 默认值**（环境变量仅用于调试）。
+
+### CI 云端编译（无 Mac 时）
+
 1. 推送本仓库，或手动触发 `build-dylib` workflow
 2. 从 Actions artifact 下载 `BiliAccelerator.dylib`
 
