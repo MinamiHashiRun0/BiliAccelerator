@@ -684,6 +684,11 @@ static NSData *BARewriteProtobufBody(NSData *payload, BOOL *changed) {
 @interface BAProxy : NSObject
 - (NSURL *)innerURLFor:(NSString *)query;
 - (long long)totalForURL:(NSURL *)url;   // 带缓存的总大小探测（失败返回 -1）
+- (NSData *)cachedPayloadForKey:(NSString *)key;
+- (void)storePayload:(NSData *)d forKey:(NSString *)key;
+- (NSData *)blockFor:(NSURL *)url index:(long long)idx blockBytes:(long long)B total:(long long)total;
+- (NSData *)serveRange:(NSURL *)url from:(long long)from to:(long long)to total:(long long)total;
+- (void)prefetchBlocks:(NSURL *)url startIndex:(long long)idx count:(NSInteger)n blockBytes:(long long)B total:(long long)total;
 - (NSData *)handleVideoSegment:(NSURL *)url
                        reqFrom:(long long)reqFrom
                          reqTo:(long long)reqTo
@@ -731,6 +736,151 @@ static BAProxy *BABackend = nil;
 }
 
 // HEAD/Range-0 探测总大小；失败返回 -1
+#pragma mark 顺序读预取缓存
+// 播放器对 dash 分段做顺序小读（实测 stride 45KB~142KB）；每次上游往返都有 RTT。
+// serve 完当前窗口后在后台预取下一同尺寸窗口，下次请求直接命中内存缓存。
+// 总量上限 64MB，超出淘汰最早条目。
+- (NSData *)cachedPayloadForKey:(NSString *)key {
+    static NSMutableDictionary *cache;
+    static NSMutableArray *order;
+    static NSLock *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [NSMutableDictionary dictionary];
+        order = [NSMutableArray array];
+        lock = [NSLock new];
+    });
+    [lock lock];
+    NSData *d = cache[key];
+    if (d) { [order removeObject:key]; [order addObject:key]; }   // LRU touch
+    [lock unlock];
+    return d;
+}
+
+- (void)storePayload:(NSData *)d forKey:(NSString *)key {
+    static NSMutableDictionary *cache;
+    static NSMutableArray *order;
+    static NSLock *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [NSMutableDictionary dictionary];
+        order = [NSMutableArray array];
+        lock = [NSLock new];
+    });
+    [lock lock];
+    cache[key] = d;
+    [order addObject:key];
+    // 容量淘汰：总字节 > 64MB 或条目 > 64 时，从最早开始删
+    while (order.count > 64) {
+        NSString *old = order.firstObject;
+        [order removeObjectAtIndex:0];
+        [cache removeObjectForKey:old];
+    }
+    [lock unlock];
+}
+
+#define BA_BLOCK_BYTES (262144LL)        // 256KB 对齐块
+#define BA_BLOCK_CACHE_MAX_BLOCKS 192     // ~48MB
+
+static NSMutableDictionary *BABlockCache;   // key: "url|blk|<idx>"
+static NSMutableArray *BABlockOrder;
+static NSMutableDictionary *BABlockInflight;
+static NSLock *BABlockLock;
+
+static void BABlockInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        BABlockCache = [NSMutableDictionary dictionary];
+        BABlockOrder = [NSMutableArray array];
+        BABlockInflight = [NSMutableDictionary dictionary];
+        BABlockLock = [NSLock new];
+    });
+}
+
+// 播放器读的是 DASH 分段边界（不等长 stride），固定同尺寸预取必然脱靶。
+// 改用对齐块缓存：任何 offset 的顺序读都能命中，serve 后后台预取后两块。
+- (NSData *)blockFor:(NSURL *)url index:(long long)idx blockBytes:(long long)B total:(long long)total {
+    NSString *key = [NSString stringWithFormat:@"%@|blk|%lld", url.absoluteString, idx];
+    long long a = idx * B;
+    long long b = a + B - 1;
+    if (total > 0) b = MIN(b, total - 1);
+    if (b < a) return nil;
+    long long expect = b - a + 1;
+
+    BABlockLock;
+    NSData *cached = BABlockCache[key];
+    if (cached && (long long)cached.length == expect) { [BABlockLock unlock]; return cached; }
+    BOOL inflight = BABlockInflight[key] != nil;
+    [BABlockLock unlock];
+
+    if (inflight) {
+        // 有并发线程在拉同一块：等待其完成（信号量轮询）
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15];
+        while ([deadline timeIntervalSinceNow] > 0) {
+            usleep(20000);
+            BABlockLock;
+            NSData *d2 = BABlockCache[key];
+            BOOL still = BABlockInflight[key] != nil;
+            [BABlockLock unlock];
+            if (d2 && (long long)d2.length == expect) return d2;
+            if (!still) break;
+        }
+        return [self cachedPayloadForKey:key];
+    }
+
+    // 标记 in-flight
+    BABlockLock;
+    BABlockInflight[key] = @(YES);
+    [BABlockLock unlock];
+
+    NSData *d = [self fetchRange:url from:a to:b lane:0];
+    BOOL ok = d && (long long)d.length == expect;
+    BABlockLock;
+    [BABlockInflight removeObjectForKey:key];
+    [BABlockLock unlock];
+    if (!ok) return nil;
+    // 写缓存 + 容量淘汰
+    [self storePayload:d forKey:key];
+    [BABlockLock lock];
+    [BABlockOrder addObject:key];
+    while (BABlockOrder.count > BA_BLOCK_CACHE_MAX_BLOCKS) {
+        NSString *old = BABlockOrder.firstObject;
+        [BABlockOrder removeObjectAtIndex:0];
+        [BABlockCache removeObjectForKey:old];
+    }
+    [BABlockLock unlock];
+    return d;
+}
+
+// 有界 Range → 跨块拼装；成功后后台预取后两块
+- (NSData *)serveRange:(NSURL *)url from:(long long)from to:(long long)to total:(long long)total {
+    long long B = BA_BLOCK_BYTES;
+    long long bi = from / B, be = to / B;
+    NSMutableData *out = [NSMutableData dataWithCapacity:(NSUInteger)(to - from + 1)];
+    for (long long i = bi; i <= be; i++) {
+        NSData *blk = [self blockFor:url index:i blockBytes:B total:total];
+        if (!blk) return nil;
+        long long cs = MAX(i * B, from);
+        long long ce = MIN(i * B + B - 1, to);
+        NSUInteger off = (NSUInteger)(cs - i * B);
+        NSUInteger len = (NSUInteger)(ce - cs + 1);
+        if (off + len > blk.length) return nil;
+        [out appendData:[blk subdataWithRange:NSMakeRange(off, len)]];
+    }
+    [self prefetchBlocks:url startIndex:be + 1 count:2 blockBytes:B total:total];
+    return out;
+}
+
+- (void)prefetchBlocks:(NSURL *)url startIndex:(long long)idx count:(NSInteger)n blockBytes:(long long)B total:(long long)total {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        for (NSInteger k = 0; k < n; k++) {
+            long long i = idx + k;
+            if (total > 0 && i * B > total - 1) return;
+            [self blockFor:url index:i blockBytes:B total:total];
+        }
+    });
+}
+
 - (long long)totalForURL:(NSURL *)url {
     if (!url) return -1;
     static NSMutableDictionary *cache;
@@ -824,16 +974,40 @@ static BAProxy *BABackend = nil;
         __block NSData *d = nil;
         __block NSInteger status = 0;
         __block NSError *err = nil;
+        __block NSString *contentRange = nil;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [[_sessions[lane % _sessions.count] dataTaskWithRequest:rq
             completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
                 err = e;
-                if ([r isKindOfClass:[NSHTTPURLResponse class]]) status = ((NSHTTPURLResponse *)r).statusCode;
+                if ([r isKindOfClass:[NSHTTPURLResponse class]]) {
+                    NSHTTPURLResponse *hr = (NSHTTPURLResponse *)r;
+                    status = hr.statusCode;
+                    contentRange = [hr valueForHTTPHeaderField:@"Content-Range"];
+                }
                 d = data;
                 dispatch_semaphore_signal(sem);
             }] resume];
         dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC));
-        if (d && (long long)d.length == expect) return d;
+        if (d && (long long)d.length == expect) {
+            // 花屏防护：校验上游确实返回了请求偏移的字节（服务器忽略 Range 时会回 200
+            // 全量或错误偏移），起始偏移不符的字节绝不能交给播放器
+            if (status == 206 && from > 0) {
+                NSString *cr = contentRange;
+                if (!cr) {
+                    // 206 却没有 Content-Range：无法确认偏移，保守丢弃换主机
+                    BAEssentialLog(@"lane %ld attempt %ld: 206 without Content-Range — 丢弃", (long)lane, (long)attempt);
+                    continue;
+                } else {
+                    long long start = strtoll(cr.UTF8String + strspn(cr.UTF8String, "bytes ="), NULL, 10);
+                    if (start != from) {
+                        BAEssentialLog(@"lane %ld attempt %ld: offset MISMATCH want %lld got %lld (%s) — 丢弃",
+                            (long)lane, (long)attempt, from, start, u.host.UTF8String ?: "-");
+                        continue;   // 换下一个主机重试
+                    }
+                }
+            }
+            return d;
+        }
         // 服务器忽略 Range 回 200 全量：from==0 时直接截断前 expect 字节
         if (status == 200 && from == 0 && d && (long long)d.length >= expect)
             return [d subdataWithRange:NSMakeRange(0, (NSUInteger)expect)];
@@ -1020,8 +1194,14 @@ static void BAServeConnection(int conn) {
         if ([path hasPrefix:@"/seg"]) {
             BAEssentialLog(@"seg req: Range=%s (from=%lld to=%lld)",
                 (rangeHeader ?: @"(none)").UTF8String, reqFrom, reqTo);
-            body = [BABackend handleVideoSegment:inner reqFrom:reqFrom reqTo:reqTo
-                                        rangeReq:rangeReq error:NULL];
+            if (rangeReq && reqFrom >= 0) {
+                long long total = [BABackend totalForURL:inner];
+                body = [BABackend serveRange:inner from:reqFrom to:reqTo total:total];
+            }
+            if (!body) {
+                body = [BABackend handleVideoSegment:inner reqFrom:reqFrom reqTo:reqTo
+                                            rangeReq:rangeReq error:NULL];
+            }
         } else if ([path hasPrefix:@"/play"]) {
             body = [BABackend passthrough:inner error:NULL];
         }
@@ -1429,6 +1609,114 @@ static id BAHookAVURLAssetInit(id self, SEL _cmd, NSURL *url, NSDictionary *opts
     return ((id (*)(id, SEL, NSURL *, NSDictionary *))BAOrigAVURLAssetInit)(self, _cmd, url, opts);
 }
 
+
+// ============ IJK URL 打开层 hook（本地逆向结论）============
+// B 站自研 IJK fork：播放器通过 IJKMediaUrlOpenDelegate.ijkUrlChange: 打开媒体，
+// IJKMediaUrlOpenData.url 可被 delegate 改写（urlChanged 标志）——这是官方认可的
+// URL 重定向通道（B 站 P2P 层即此方式）。在此层改写不依赖 reply 拷贝时机。
+// FFPlay 控制器（IJKFFMoviePlayerControllerFFPlay）持有 5 个 delegate：
+//   file/segment/http（媒体相关，需包装）、live（直播，跳过）、tcp（连接级，跳过）。
+@protocol BAIJKOpenDataProxy <NSObject>
+@property(nonatomic, copy) NSString *url;
+@property(nonatomic, assign) BOOL urlChanged;
+@property(nonatomic, assign) int isAudio;
+@property(nonatomic, assign) int segmentIndex;
+@property(nonatomic, assign) int retryCounter;
+@end
+
+@interface BAIJKOpenDelegateWrap : NSObject
+@property(nonatomic, strong) id orig;
++ (instancetype)wrap:(id)orig;
+- (void)ijkUrlChange:(id<BAIJKOpenDataProxy>)data;
+@end
+
+@implementation BAIJKOpenDelegateWrap
++ (instancetype)wrap:(id)orig {
+    if (!orig) return nil;
+    // 已是 wrapper 的不二次包装
+    if ([orig isKindOfClass:self]) return orig;
+    BAIJKOpenDelegateWrap *w = [[self alloc] init];
+    w.orig = orig;
+    return w;
+}
+- (BOOL)respondsToSelector:(SEL)sel {
+    if (sel == @selector(ijkUrlChange:)) return YES;
+    return [_orig respondsToSelector:sel] || [super respondsToSelector:sel];
+}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {
+    NSMethodSignature *s = [(id)_orig methodSignatureForSelector:sel];
+    return s ?: [super methodSignatureForSelector:sel];
+}
+- (void)forwardInvocation:(NSInvocation *)inv {
+    id o = _orig;
+    if (o && [o respondsToSelector:inv.selector]) [inv invokeWithTarget:o];
+}
+- (void)ijkUrlChange:(id<BAIJKOpenDataProxy>)data {
+    @try {
+        NSString *u = data.url;
+        if (u && BAEnabled() && ![u hasPrefix:@"http://127.0.0.1"]) {
+            NSURL *uu = [NSURL URLWithString:u];
+            if (uu && BAIsMediaURL(uu) && !BAIsLiveMedia(uu)) {
+                BOOL audio = NO;
+                if ([data respondsToSelector:@selector(isAudio)]) audio = data.isAudio != 0;
+                if (!audio) {
+                    NSString *reason = nil;
+                    NSString *next = BAWrapProxy(BARewriteUrlDetail(u, &reason));
+                    if (next && ![next isEqualToString:u]) {
+                        data.url = next;
+                        data.urlChanged = YES;
+                        BAEssentialLog(@"open-rewrite seg=%d [%@] → %s",
+                            data.segmentIndex, reason ?: @"?", next.UTF8String);
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) { (void)e; }
+    id o = _orig;
+    if (o && [o respondsToSelector:@selector(ijkUrlChange:)]) {
+        [(id)o ijkUrlChange:data];
+    }
+}
+@end
+
+// delegate setter 三连 swizzle（segment/http/file；live/tcp 跳过）
+static IMP BAOrigSetSegDelegate = NULL;
+static IMP BAOrigSetHttpDelegate = NULL;
+static IMP BAOrigSetFileDelegate = NULL;
+
+static void BAWrapSetSegDelegate(id self, SEL _cmd, id d) {
+    ((void (*)(id, SEL, id))BAOrigSetSegDelegate)(self, _cmd, [BAIJKOpenDelegateWrap wrap:d]);
+}
+static void BAWrapSetHttpDelegate(id self, SEL _cmd, id d) {
+    ((void (*)(id, SEL, id))BAOrigSetHttpDelegate)(self, _cmd, [BAIJKOpenDelegateWrap wrap:d]);
+}
+static void BAWrapSetFileDelegate(id self, SEL _cmd, id d) {
+    ((void (*)(id, SEL, id))BAOrigSetFileDelegate)(self, _cmd, [BAIJKOpenDelegateWrap wrap:d]);
+}
+
+static void BAWrapOpenDelegates(void) {
+    // FFPlay 与 AVPlayer 两个控制器类都可能有这些 setter
+    NSArray *clsNames = @[ @"IJKFFMoviePlayerControllerFFPlay",
+                           @"IJKFFMoviePlayerController" ];
+    for (NSString *cn in clsNames) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
+        struct { const char *sel; IMP *orig; void *newfn; } specs[] = {
+            { "setSegmentOpenDelegate:", &BAOrigSetSegDelegate,   (void *)&BAWrapSetSegDelegate },
+            { "setHttpOpenDelegate:",    &BAOrigSetHttpDelegate,  (void *)&BAWrapSetHttpDelegate },
+            { "setFileOpenDelegate:",    &BAOrigSetFileDelegate,  (void *)&BAWrapSetFileDelegate },
+        };
+        for (NSUInteger i = 0; i < sizeof(specs)/sizeof(specs[0]); i++) {
+            SEL s = sel_registerName(specs[i].sel);
+            Method m = class_getInstanceMethod(c, s);
+            if (!m || *specs[i].orig) continue;
+            *specs[i].orig = method_getImplementation(m);
+            method_setImplementation(m, (IMP)specs[i].newfn);
+            BAEssentialLog(@"open-delegate wrap: %s on %s", specs[i].sel, cn.UTF8String);
+        }
+    }
+}
+
 static void BAHookGrpcModels(void) {
     // AVURLAsset（AVPlayer 引擎）诊断 hook
     if (!BAOrigAVURLAssetInit) {
@@ -1514,6 +1802,62 @@ static NSURLSessionDataTask *BAHookDataTask(id self, SEL _cmd, NSURLRequest *req
     return BAOrigDataTask(self, @selector(dataTaskWithRequest:completionHandler:), req, wrapped);
 }
 
+#pragma mark - 运行时类 dump（本地逆向：SIMCTL_CHILD_BiliAcc_dump=IJK,BBPlayer,...）
+
+// 把匹配前缀的 ObjC 类的方法/属性表 dump 到 tmp/dump_<类名>.txt，
+// 供本地静态分析播放器 URL 流转（模拟器 loop 免真机迭代）
+static void BARuntimeDump(void) {
+    NSString *spec = BAEnvOverride(@"BiliAcc_dump");
+    if (!spec.length) return;
+    NSArray *prefixes = [spec componentsSeparatedByString:@","];
+    unsigned int n = 0;
+    Class *classes = objc_copyClassList(&n);
+    if (!classes) return;
+    @autoreleasepool {
+        for (unsigned int i = 0; i < n; i++) {
+            Class c = classes[i];
+            NSString *name = NSStringFromClass(c);
+            BOOL hit = NO;
+            for (NSString *p in prefixes) if ([name hasPrefix:p]) { hit = YES; break; }
+            if (!hit) continue;
+            NSMutableString *out = [NSMutableString stringWithFormat:@"== %@ ==\n\n[properties]\n", name];
+            unsigned int pc = 0;
+            objc_property_t *props = class_copyPropertyList(c, &pc);
+            for (unsigned int j = 0; j < pc; j++) {
+                const char *pn = property_getName(props[j]);
+                const char *pa = property_getAttributes(props[j]);
+                [out appendFormat:@"%s  (%s)\n", pn, pa];
+            }
+            free(props);
+            [out appendString:@"\n[instance methods]\n"];
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(c, &mc);
+            for (unsigned int j = 0; j < mc; j++) {
+                [out appendFormat:@"%@ %s\n",
+                    NSStringFromSelector(method_getName(ms[j])),
+                    method_getTypeEncoding(ms[j])];
+            }
+            free(ms);
+            [out appendString:@"\n[class methods]\n"];
+            Class meta = object_getClass(c);
+            unsigned int mc2 = 0;
+            Method *ms2 = class_copyMethodList(meta, &mc2);
+            for (unsigned int j = 0; j < mc2; j++) {
+                [out appendFormat:@"+ %@ %s\n",
+                    NSStringFromSelector(method_getName(ms2[j])),
+                    method_getTypeEncoding(ms2[j])];
+            }
+            free(ms2);
+            NSString *path = [NSTemporaryDirectory()
+                stringByAppendingFormat:@"dump_%@.txt", name];
+            [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            NSLog(@"[BiliAcc] dumped %s (%u props, %u im, %u cm) -> %s",
+                  name.UTF8String, pc, mc, mc2, path.lastPathComponent.UTF8String);
+        }
+    }
+    free(classes);
+}
+
 #pragma mark - 入口
 
 // constructor 里不能用 BAQuery*（它们依赖 ObjC runtime 完全就绪的时序没问题，
@@ -1549,7 +1893,10 @@ static void BiliAccInit(void) {
         // 延迟到 +load 之后的下一个 runloop：让 App 把所有 framework 类加载完
         dispatch_async(dispatch_get_main_queue(), ^{
             BAHookGrpcModels();
+            BARuntimeDump();
         });
+        // delegate 包装 swizzle：FFPlay 类静态链接于主二进制，构造期即可用
+        BAWrapOpenDelegates();
 
         BAEssentialLog(@"loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld, verbose=%d",
               (long)BAProxyPort(), BAMode(), BATargetHost(), (long)BAConcurrency(), BAVerbose());
