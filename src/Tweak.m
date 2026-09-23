@@ -553,7 +553,11 @@ static NSData *BARewriteProtobufBody(NSData *payload, BOOL *changed) {
 // 按字节序拼接后以 HTTP 200 响应给播放器。音频流永远不会路由到这里。
 @interface BAProxy : NSObject
 - (NSURL *)innerURLFor:(NSString *)query;
-- (NSData *)handleVideoSegment:(NSURL *)url error:(NSError **)err;
+- (NSData *)handleVideoSegment:(NSURL *)url
+                       reqFrom:(long long)reqFrom
+                         reqTo:(long long)reqTo
+                      rangeReq:(BOOL)rangeReq
+                         error:(NSError **)err;
 - (NSData *)passthrough:(NSURL *)url error:(NSError **)err;
 @end
 
@@ -642,37 +646,87 @@ static BAProxy *BABackend = nil;
     return nil;
 }
 
-// 并发拉取整个视频文件
-- (NSData *)handleVideoSegment:(NSURL *)url error:(NSError **)err {
+// 解析播放器发来的 Range 头："bytes=123-456" / "bytes=123-" / "bytes=-456"
+// 返回 (from, to, ok)；open-ended 用 -1 表示
+static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) {
+    *from = -1; *to = -1;
+    if (!rangeHeader.length) return NO;
+    NSString *s = [rangeHeader lowercaseString];
+    if (![s hasPrefix:@"bytes="]) return NO;
+    s = [s substringFromIndex:6];
+    NSRange dash = [s rangeOfString:@"-"];
+    if (dash.location == NSNotFound) return NO;
+    NSString *a = [s substringToIndex:dash.location];
+    NSString *b = [s substringFromIndex:dash.location + 1];
+    if (a.length) *from = strtoll(a.UTF8String, NULL, 10);
+    if (b.length) *to = strtoll(b.UTF8String, NULL, 10);
+    return a.length > 0 || b.length > 0;
+}
+
+// 并发拉取播放器请求的字节窗口 [reqFrom, reqTo]
+// 核心逻辑：把窗口均分成 N 段（N = 并发路数），每段独立 Range 请求，按序拼接。
+// 只拉播放器要的字节 —— 不再全文件下载。
+- (NSData *)handleVideoSegment:(NSURL *)url
+                       reqFrom:(long long)reqFrom
+                         reqTo:(long long)reqTo
+                      rangeReq:(BOOL)rangeReq
+                         error:(NSError **)err {
     if (err) *err = nil;
     if (!url || !url.host) return nil;
     NSString *target = BARewriteUrlDetail(url.absoluteString, NULL);
     NSURL *real = [NSURL URLWithString:target];
     if (!real) return nil;
 
-    long long total = [self probeTotalSize:real];
-    BALog(@"seg proxy: total=%lld host=%@", total, real.host);
-    if (total <= 0) {
-        // CDN 不支持 Range/HEAD → 单连接全量下载兜底
-        BALog(@"Range probe failed, falling back to single connection");
-        NSMutableURLRequest *one = [NSMutableURLRequest requestWithURL:real];
-        one.timeoutInterval = 30;
+    // 无 Range 头（整文件请求）或 open-ended：探测总大小补全窗口
+    if (reqTo < 0) {
+        long long total = [self probeTotalSize:real];
+        if (total <= 0) {
+            // 探测失败 → 单连接直拉，不带 Range
+            BALog(@"seg: probe failed, single-connection fallback");
+            NSMutableURLRequest *one = [NSMutableURLRequest requestWithURL:real];
+            one.timeoutInterval = 30;
+            __block NSData *body = nil;
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            [[_sessions[0] dataTaskWithRequest:one
+                completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                    body = d; if (err) *err = e;
+                    dispatch_semaphore_signal(sem);
+                }] resume];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * NSEC_PER_SEC));
+            return body;
+        }
+        if (reqFrom < 0) reqFrom = 0;                  // bytes=-456 → suffix range
+        reqTo = total - 1;
+    }
+
+    long long windowSize = reqTo - reqFrom + 1;
+    NSInteger lanes = (NSInteger)BAConcurrency();
+    // 窗口小于 1MB 时并发无意义（握手开销 > 收益），单连接直接拉
+    if (windowSize < 1024 * 1024 || lanes <= 1) {
+        BALog(@"seg: window %lld-%lld (%lldKB) single connection",
+              reqFrom, reqTo, windowSize / 1024);
+        NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:real];
+        [rq setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", reqFrom, reqTo]
+            forHTTPHeaderField:@"Range"];
+        [rq setTimeoutInterval:60];
         __block NSData *body = nil;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [[_sessions[0] dataTaskWithRequest:one
+        [[_sessions[0] dataTaskWithRequest:rq
             completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
                 body = d; if (err) *err = e;
                 dispatch_semaphore_signal(sem);
             }] resume];
         dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * NSEC_PER_SEC));
-        return body;
+        if (body && (long long)body.length == windowSize) return body;
+        return body;   // 长度不符也返回（有些服务器忽略 Range 返回 200 全量）
     }
 
-    long long chunk = (long long)BAChunkMB() * 1024 * 1024;
-    NSInteger nseg = (NSInteger)((total + chunk - 1) / chunk);
-    BALog(@"fan-out: %ld segments × %ldMB, lanes=%ld",
-          (long)nseg, (long)BAChunkMB(), (long)BAConcurrency());
-    // ARC 下不能用 calloc 裸指针放 ObjC 对象，改用 NSMutableArray（占位 NSNull）
+    // 把窗口均分成 lanes 段（尾段余量并入最后一段）
+    long long slice = (windowSize + lanes - 1) / lanes;
+    NSInteger nseg = (NSInteger)((windowSize + slice - 1) / slice);
+    BALog(@"seg: window %lld-%lld (%lldMB) → %ld slices, %lldKB each",
+          reqFrom, reqTo, windowSize / 1024 / 1024, (long)nseg, slice / 1024);
+
     NSMutableArray<NSData *> *buffers = [NSMutableArray arrayWithCapacity:(NSUInteger)nseg];
     for (NSInteger i = 0; i < nseg; i++) [buffers addObject:[NSNull null]];
     dispatch_group_t group = dispatch_group_create();
@@ -680,8 +734,8 @@ static BAProxy *BABackend = nil;
     __block BOOL failed = NO;
 
     for (NSInteger idx = 0; idx < nseg; idx++) {
-        long long from = (long long)idx * chunk;
-        long long to = MIN(from + chunk, total) - 1;
+        long long from = reqFrom + (long long)idx * slice;
+        long long to = MIN(from + slice, reqTo + 1) - 1;
         dispatch_group_enter(group);
         dispatch_async(laneQ, ^{
             NSData *part = [self fetchRange:real from:from to:to lane:idx];
@@ -696,12 +750,14 @@ static BAProxy *BABackend = nil;
     dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
 
     if (failed) {
-        return nil;   // 任一分段失败 → 502，播放器自动 failover 到 backupUrl
+        BALog(@"seg: slice FAILED → 502 (player will failover)");
+        return nil;
     }
-    NSMutableData *all = [NSMutableData dataWithCapacity:(NSUInteger)total];
+    NSMutableData *all = [NSMutableData dataWithCapacity:(NSUInteger)windowSize];
     for (NSInteger i = 0; i < nseg; i++) {
         [all appendData:buffers[i]];
     }
+    BALog(@"seg: window done %lld bytes", (long long)all.length);
     return all;
 }
 
@@ -730,7 +786,7 @@ static int BAListenFD = -1;
 
 static void BAServeConnection(int conn) {
     @try {
-        char buf[8192];
+        char buf[16384];
         size_t got = 0;
         while (got < sizeof(buf) - 4) {
             ssize_t n = recv(conn, buf + got, 1, 0);
@@ -750,9 +806,26 @@ static void BAServeConnection(int conn) {
         NSURL *abs = [NSURL URLWithString:[@"http://127.0.0.1" stringByAppendingString:path]];
         NSURL *inner = [BABackend innerURLFor:abs.query ?: @""];
 
+        // 解析播放器的 Range 头
+        NSString *rangeHeader = nil;
+        for (NSString *line in lines) {
+            NSRange colon = [line rangeOfString:@":"];
+            if (colon.location == NSNotFound) continue;
+            NSString *key = [[line substringToIndex:colon.location]
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if ([key caseInsensitiveCompare:@"Range"] == 0) {
+                rangeHeader = [[line substringFromIndex:colon.location + 1]
+                    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                break;
+            }
+        }
+        long long reqFrom = -1, reqTo = -1;
+        BOOL rangeReq = BAParseRange(rangeHeader, &reqFrom, &reqTo);
+
         NSData *body = nil;
         if ([path hasPrefix:@"/seg"]) {
-            body = [BABackend handleVideoSegment:inner error:NULL];
+            body = [BABackend handleVideoSegment:inner reqFrom:reqFrom reqTo:reqTo
+                                        rangeReq:rangeReq error:NULL];
         } else if ([path hasPrefix:@"/play"]) {
             body = [BABackend passthrough:inner error:NULL];
         }
@@ -763,9 +836,24 @@ static void BAServeConnection(int conn) {
             close(conn);
             return;
         }
-        NSString *hdr = [NSString stringWithFormat:
-            @"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
-             "Content-Length: %zu\r\nConnection: close\r\n\r\n", body.length];
+
+        // 有 Range 请求 → 回 206 + Content-Range；无 → 200
+        NSString *hdr;
+        if (rangeReq && reqFrom >= 0) {
+            hdr = [NSString stringWithFormat:
+                @"HTTP/1.1 206 Partial Content\r\n"
+                 "Content-Type: application/octet-stream\r\n"
+                 "Content-Range: bytes %lld-%lld/*\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                reqFrom, reqFrom + (long long)body.length - 1, body.length];
+        } else {
+            hdr = [NSString stringWithFormat:
+                @"HTTP/1.1 200 OK\r\n"
+                 "Content-Type: application/octet-stream\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Accept-Ranges: bytes\r\nConnection: close\r\n\r\n", body.length];
+        }
         NSData *hdrData = [hdr dataUsingEncoding:NSUTF8StringEncoding];
         send(conn, hdrData.bytes, hdrData.length, 0);
         NSUInteger offset = 0;
