@@ -1142,7 +1142,7 @@ static id BARewriteMediaValue(id val) {
 
 // 递归遍历对象属性树，改写所有媒体 URL。excludes 防御环形引用。
 static void BADeepRewrite(id obj, NSString *keyPath, int depth, NSMutableSet *seen) {
-    if (depth > 8 || !obj || seen.contains(obj)) return;
+    if (depth > 8 || !obj || [seen containsObject:obj]) return;
     [seen addObject:obj];
 
     if ([obj isKindOfClass:[NSArray class]]) {
@@ -1166,8 +1166,9 @@ static void BADeepRewrite(id obj, NSString *keyPath, int depth, NSMutableSet *se
                 if (next) {
                     @try {
                         [obj setValue:next forKey:pname];
+                        NSString *ns = (NSString *)next;
                         BAEssentialLog(@"rt-rewrite %@: %@",
-                            childPath, [next substringToIndex:MIN((NSUInteger)90, next.length)]);
+                            childPath, [ns substringToIndex:MIN((NSUInteger)90, ns.length)]);
                     } @catch (NSException *e) { (void)e; }
                 }
             } else if ([val isKindOfClass:[NSArray class]] ||
