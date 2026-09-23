@@ -779,12 +779,48 @@ static BAProxy *BABackend = nil;
 }
 
 // 单次 Range 拉取（带一次重试），成功返回精确 expect 字节，否则 nil
+// 备用镜像主机（签名参数与主机无关，换主机是这类加速工具的标准手段）
+- (NSArray<NSString *> *)fallbackHosts {
+    static dispatch_once_t once;
+    static NSArray *s;
+    dispatch_once(&once, ^{
+        s = @[
+            @"upos-sz-mirrorali.bilivideo.com",
+            @"upos-sz-mirrorhw.bilivideo.com",
+            @"upos-sz-mirrorcos.bilivideo.com",
+            @"upos-tf-all-tx.bilivideo.com",
+            @"upos-tf-all-hw.bilivideo.com",
+        ];
+    });
+    return s;
+}
+
+- (NSURL *)urlWithFallbackHost:(NSURL *)url attempt:(NSInteger)attempt {
+    if (!url.host || attempt <= 0) return url;
+    NSArray *cands = [self fallbackHosts];
+    NSInteger idx = (attempt - 1) % (NSInteger)cands.count;
+    // 跳过与当前主机相同的候选
+    NSString *cur = url.host.lowercaseString;
+    for (NSInteger k = 0; k < (NSInteger)cands.count; k++) {
+        NSString *h = cands[(NSUInteger)((idx + k) % cands.count)];
+        if (![h isEqualToString:cur]) {
+            NSURLComponents *c = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+            if (!c) return url;
+            c.host = h;
+            return c.URL;
+        }
+    }
+    return url;
+}
+
 - (NSData *)fetchRange:(NSURL *)real from:(long long)from to:(long long)to lane:(NSInteger)lane {
     long long expect = to - from + 1;
-    for (NSInteger attempt = 0; attempt < 2; attempt++) {
-        NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:real];
+    NSInteger attempts = 4;   // 原始主机 + 3 个备用镜像
+    for (NSInteger attempt = 0; attempt < attempts; attempt++) {
+        NSURL *u = [self urlWithFallbackHost:real attempt:attempt];
+        NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u];
         [rq setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", from, to] forHTTPHeaderField:@"Range"];
-        [rq setTimeoutInterval:60];
+        [rq setTimeoutInterval:15];
         __block NSData *d = nil;
         __block NSInteger status = 0;
         __block NSError *err = nil;
@@ -796,13 +832,13 @@ static BAProxy *BABackend = nil;
                 d = data;
                 dispatch_semaphore_signal(sem);
             }] resume];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 70LL * NSEC_PER_SEC));
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 20LL * NSEC_PER_SEC));
         if (d && (long long)d.length == expect) return d;
         // 服务器忽略 Range 回 200 全量：from==0 时直接截断前 expect 字节
         if (status == 200 && from == 0 && d && (long long)d.length >= expect)
             return [d subdataWithRange:NSMakeRange(0, (NSUInteger)expect)];
-        BAEssentialLog(@"lane %ld attempt %ld range %lld-%lld status=%ld got %zu bytes (expect %lld) err=%@",
-              (long)lane, (long)attempt, from, to, (long)status, d ? d.length : 0, expect,
+        BAEssentialLog(@"lane %ld attempt %ld host %@ range %lld-%lld status=%ld got %zu (expect %lld) err=%@",
+              (long)lane, (long)attempt, u.host, from, to, (long)status, d ? d.length : 0, expect,
               err.localizedDescription ?: @"(none)");
     }
     return nil;
@@ -1383,7 +1419,28 @@ static Class BAFindReplyClass(NSArray<NSString *> *candidates) {
     return nil;
 }
 
+// 诊断：AVPlayer 后备引擎的媒体 URL（真机 VIP 流疑似走 IJKFFMoviePlayerControllerAVPlayer）
+static IMP BAOrigAVURLAssetInit = NULL;
+static id BAHookAVURLAssetInit(id self, SEL _cmd, NSURL *url, NSDictionary *opts) {
+    if (url && BAIsMediaURL(url) && !BAIsLiveMedia(url)) {
+        BAEssentialLog(@"AVURLAsset open: %@", url.absoluteString);
+    }
+    return ((id (*)(id, SEL, NSURL *, NSDictionary *))BAOrigAVURLAssetInit)(self, _cmd, url, opts);
+}
+
 static void BAHookGrpcModels(void) {
+    // AVURLAsset（AVPlayer 引擎）诊断 hook
+    if (!BAOrigAVURLAssetInit) {
+        Class avCls = objc_getClass("AVURLAsset");
+        Method avm = avCls ? class_getInstanceMethod(avCls, @selector(initWithURL:options:)) : NULL;
+        if (avm) {
+            BAOrigAVURLAssetInit = method_getImplementation(avm);
+            method_setImplementation(avm, (IMP)BAHookAVURLAssetInit);
+            BAEssentialLog(@"AVURLAsset hook installed");
+        } else {
+            BAEssentialLog(@"AVURLAsset initWithURL:options: not found");
+        }
+    }
     SEL sel = NSSelectorFromString(@"initWithData:extensionRegistry:error:");
 
     // 新统一播放器：PlayViewUnite
