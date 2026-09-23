@@ -106,7 +106,7 @@ int main(void) {
         NSRange audioLoc = [outStr rangeOfString:@"30216.m4s"];
         BOOL audioProxied = NO;
         if (audioLoc.location != NSNotFound) {
-            NSRange tail = [outStr rangeOfString:@"127.0.0.1" range:NSMakeRange(audioLoc.location, outStr.length - audioLoc.location)];
+            NSRange tail = [outStr rangeOfString:@"127.0.0.1" options:0 range:NSMakeRange(audioLoc.location, outStr.length - audioLoc.location)];
             audioProxied = tail.location != NSNotFound;
         }
         CHECK(!audioProxied, "protobuf: audio NOT wrapped in proxy");
@@ -135,7 +135,7 @@ int main(void) {
         NSRange aJ = [jout rangeOfString:@"30216.m4s"];
         CHECK(aJ.location != NSNotFound, "json: audio present");
         if (aJ.location != NSNotFound) {
-            NSRange tail = [jout rangeOfString:@"127.0.0.1" range:NSMakeRange(aJ.location, jout.length - aJ.location)];
+            NSRange tail = [jout rangeOfString:@"127.0.0.1" options:0 range:NSMakeRange(aJ.location, jout.length - aJ.location)];
             CHECK(tail.location == NSNotFound, "json: audio NOT wrapped in proxy");
         }
 

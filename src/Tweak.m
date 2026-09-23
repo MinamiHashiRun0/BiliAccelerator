@@ -275,7 +275,55 @@ static NSString *BARewriteUrlDetail(NSString *rawUrl, NSString **reason) {
 
 #pragma mark - Payload 遍历（JSON 路径）
 
-// 识别 dash 容器后只处理 video / durl，audio 一律不碰
+// JSON playurl 深改写（通用递归，键名含 audio/dolby/lossless 的子树剪枝）
+static void BARewriteJsonDeep(NSMutableDictionary *obj, BOOL *changed, NSInteger depth) {
+    if (depth > 10 || !obj) return;
+    for (NSString *key in [obj copy]) {
+        id val = obj[key];
+        if ([val isKindOfClass:[NSMutableDictionary class]]) {
+            if ([key.lowercaseString containsString:@"audio"] ||
+                [key.lowercaseString containsString:@"dolby"] ||
+                [key.lowercaseString containsString:@"lossless"]) {
+                continue;   // 音频子树剪枝
+            }
+            BARewriteJsonDeep(val, changed, depth + 1);
+        } else if ([val isKindOfClass:[NSMutableArray class]]) {
+            BOOL audioKey = [key.lowercaseString containsString:@"audio"] ||
+                            [key.lowercaseString containsString:@"dolby"] ||
+                            [key.lowercaseString containsString:@"lossless"];
+            if (audioKey) continue;
+            for (id item in val) {
+                if ([item isKindOfClass:[NSMutableDictionary class]]) {
+                    BARewriteJsonDeep(item, changed, depth + 1);
+                }
+            }
+        } else if ([val isKindOfClass:[NSString class]]) {
+            NSString *next = BARewriteMediaValue(val);
+            if (next) {
+                obj[key] = next;
+                *changed = YES;
+                BALog(@"json-rewrite %{public}@: %{public}@", key,
+                      [next substringToIndex:MIN((NSUInteger)100, next.length)]);
+            }
+        }
+    }
+}
+
+static NSString *BARewriteJsonPayload(NSString *json, BOOL *changed) {
+    *changed = NO;
+    NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data || !BAEnabled()) return json;
+    id root = [NSJSONSerialization JSONObjectWithData:data
+                                              options:NSJSONReadingMutableContainers
+                                                error:NULL];
+    if (![root isKindOfClass:[NSMutableDictionary class]]) return json;
+    BARewriteJsonDeep(root, changed, 0);
+    if (!*changed) return json;
+    NSData *out = [NSJSONSerialization dataWithJSONObject:root options:0 error:NULL];
+    return out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : json;
+}
+
+// 旧版 dash 容器遍历（保留：明确 dash 结构时的确定性路径）
 static void BARewriteDashContainer(NSDictionary *container, BOOL *changed) {
     NSDictionary *dash = nil;
     if ([container isKindOfClass:[NSDictionary class]]) {
