@@ -275,6 +275,9 @@ static NSString *BARewriteUrlDetail(NSString *rawUrl, NSString **reason) {
 
 #pragma mark - Payload 遍历（JSON 路径）
 
+// 前向声明（定义在运行时递归改写段）
+static id BARewriteMediaValue(id val);
+
 // JSON playurl 深改写（通用递归，键名含 audio/dolby/lossless 的子树剪枝）
 static void BARewriteJsonDeep(NSMutableDictionary *obj, BOOL *changed, NSInteger depth) {
     if (depth > 10 || !obj) return;
