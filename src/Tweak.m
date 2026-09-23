@@ -9,6 +9,8 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <stdlib.h>
+#import <fcntl.h>
+#import <unistd.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
@@ -116,15 +118,40 @@ static BOOL BAVerbose(void) {
 }
 
 // 新系统的 NSLog→os_log 链路对 %{public}s/@ 支持不稳定（输出 "<decode: missing data>"
-// 或字面 "{public}s"）。改用普通格式符：stderr（console-pty/Mac 直跑）下完整可见；
-// Console.app 看到的动态串会被隐私化为 <private>，但行仍在，足以确认时序。
-#define BALog(...) do { if (BAVerbose()) NSLog(@"[BiliAcc] " __VA_ARGS__); } while (0)
+// 或字面 "{public}s"）。改用普通格式符；同时并行写入文件日志（App tmp/BiliAcc.log），
+// 真机上可直接用 devicectl 拉取，无需 root/Console。
+static void BAApendLog(NSString *msg) {
+    static NSString *path;
+    static int fd = -2;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"BiliAcc.log"];
+        // 超 4MB 截断，防无限增长
+        NSDictionary *attr = [NSFileManager.defaultManager
+            attributesOfItemAtPath:path error:nil];
+        if (attr && [attr fileSize] > 5 * 1024 * 1024)
+            [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+    });
+    if (fd == -2)
+        fd = open(path.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd > 0) {
+        const char *s = [msg UTF8String];
+        if (s) { ssize_t ignore = write(fd, s, strlen(s)); (void)ignore; }
+        ssize_t ignore2 = write(fd, "\n", 1); (void)ignore2;
+    }
+}
 
-// 无条件日志：关键链路前 8 条必打（验证链路不需要用户开 verbose）
-static volatile int BAEssentialCount = 0;
+// Console.app 继续受 verbose/前8条限制（避免系统日志噪音）；文件日志无条件全量，
+// 真机调试直接 devicectl 拉取 tmp/BiliAcc.log。
+#define BALog(...) do { if (BAVerbose()) { \
+    NSString *_m = [NSString stringWithFormat:@"[BiliAcc] " __VA_ARGS__]; \
+    NSLog(@"%@", _m); } } while (0)
+
 #define BAEssentialLog(...) do { \
-    int _c = __sync_add_and_fetch(&BAEssentialCount, 1); \
-    if (_c <= 8 || BAVerbose()) NSLog(@"[BiliAcc] " __VA_ARGS__); \
+    NSString *_m = [NSString stringWithFormat:@"[BiliAcc] " __VA_ARGS__]; \
+    BAApendLog(_m); \
+    static volatile int _c_once = 0; \
+    if (__sync_add_and_fetch(&_c_once, 1) <= 8 || BAVerbose()) NSLog(@"%@", _m); \
 } while (0)
 
 // WebSocket/HTTP 代理器（如代理软件）会把 127.0.0.1 流量直连，不会重复加速
@@ -808,7 +835,7 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
     NSInteger lanes = (NSInteger)BAConcurrency();
     // 窗口小于 1MB 时并发无意义（握手开销 > 收益），单连接直接拉
     if (windowSize < 1024 * 1024 || lanes <= 1) {
-        BALog(@"seg: window %lld-%lld (%lldKB) single connection",
+        BAEssentialLog(@"seg: window %lld-%lld (%lldKB) single connection",
               reqFrom, reqTo, windowSize / 1024);
         NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:real];
         [rq setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", reqFrom, reqTo]
@@ -829,7 +856,7 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
     // 把窗口均分成 lanes 段（尾段余量并入最后一段）
     long long slice = (windowSize + lanes - 1) / lanes;
     NSInteger nseg = (NSInteger)((windowSize + slice - 1) / slice);
-    BALog(@"seg: window %lld-%lld (%lldMB) → %ld slices, %lldKB each",
+    BAEssentialLog(@"seg: window %lld-%lld (%lldMB) → %ld slices, %lldKB each",
           reqFrom, reqTo, windowSize / 1024 / 1024, (long)nseg, slice / 1024);
 
     NSMutableArray<NSData *> *buffers = [NSMutableArray arrayWithCapacity:(NSUInteger)nseg];
@@ -862,7 +889,7 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
     for (NSInteger i = 0; i < nseg; i++) {
         [all appendData:buffers[i]];
     }
-    BALog(@"seg: window done %lld bytes", (long long)all.length);
+    BAEssentialLog(@"seg: window done %lld bytes", (long long)all.length);
     return all;
 }
 
@@ -1160,7 +1187,7 @@ static void BAHookCronet(void) {
         if (target) BALog(@"cronet symbol via dlsym: %p", target);
     }
     if (!target) {
-        NSLog(@"[BiliAcc] Cronet_UrlRequest_InitWithParams NOT FOUND - hook skipped");
+        BAEssentialLog(@"Cronet_UrlRequest_InitWithParams NOT FOUND - hook skipped");
         return;
     }
     void *trampoline = BAMakeTrampoline(target);
@@ -1309,7 +1336,7 @@ static Class BAFindReplyClass(NSArray<NSString *> *candidates) {
     for (NSString *name in candidates) {
         Class c = objc_getClass(name.UTF8String);
         if (c) {
-            NSLog(@"[BiliAcc] found reply class: %{public}s", name.UTF8String);
+            BAEssentialLog(@"found reply class: %@", name);
             return c;
         }
     }
@@ -1331,7 +1358,7 @@ static void BAHookGrpcModels(void) {
         if (m) {
             BAOrigPVUInit = (id (*)(id, SEL, id, id, id *))method_getImplementation(m);
             method_setImplementation(m, (IMP)BAHookPVUInit);
-            NSLog(@"[BiliAcc] hooked PlayViewUniteReply initWithData");
+            BAEssentialLog(@"hooked PlayViewUniteReply initWithData");
         }
     }
 
@@ -1347,7 +1374,7 @@ static void BAHookGrpcModels(void) {
         if (m) {
             BAOrigPVInit = (id (*)(id, SEL, id, id, id *))method_getImplementation(m);
             method_setImplementation(m, (IMP)BAHookPVInit);
-            NSLog(@"[BiliAcc] hooked PlayViewReply initWithData");
+            BAEssentialLog(@"hooked PlayViewReply initWithData");
         }
     }
 
@@ -1399,9 +1426,9 @@ static void BiliAccInitUnused(void) { (void)0; }
 __attribute__((constructor))
 static void BiliAccInit(void) {
     @autoreleasepool {
-        NSLog(@"[BiliAcc] dylib constructor entered (build %s)", __DATE__ " " __TIME__);
+        BAEssentialLog(@"dylib constructor entered (build %s)", __DATE__ " " __TIME__);
         if (!BAEnabled()) {
-            NSLog(@"[BiliAcc] disabled via BiliAcc_enabled, exiting");
+            BAEssentialLog(@"disabled via BiliAcc_enabled, exiting");
             return;
         }
         BABackend = [BAProxy new];
@@ -1426,7 +1453,7 @@ static void BiliAccInit(void) {
             BAHookGrpcModels();
         });
 
-        NSLog(@"[BiliAcc] loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld, verbose=%d",
+        BAEssentialLog(@"loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld, verbose=%d",
               (long)BAProxyPort(), BAMode(), BATargetHost(), (long)BAConcurrency(), BAVerbose());
     }
 }
