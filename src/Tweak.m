@@ -858,7 +858,8 @@ static BOOL BAIsPlayviewURL(NSString *u) {
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
-#import <mach/vm_map.h>
+#import <mach/mach.h>
+#import <mach/mach_vm.h>
 #import <mach/mach_init.h>
 #import <libkern/OSCacheControl.h>
 
