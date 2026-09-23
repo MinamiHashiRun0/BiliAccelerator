@@ -810,6 +810,7 @@ static void BAServeConnection(int conn) {
         if (parts.count < 2) { close(conn); return; }
 
         NSString *path = parts[1];
+        BAEssentialLog(@"conn: %{public}@", path);
         NSURL *abs = [NSURL URLWithString:[@"http://127.0.0.1" stringByAppendingString:path]];
         NSURL *inner = [BABackend innerURLFor:abs.query ?: @""];
 
@@ -831,7 +832,7 @@ static void BAServeConnection(int conn) {
 
         NSData *body = nil;
         if ([path hasPrefix:@"/seg"]) {
-            BAEssentialLog(@"seg req: Range=%@ (from=%lld to=%lld)",
+            BAEssentialLog(@"seg req: Range=%{public}@ (from=%lld to=%lld)",
                 rangeHeader ?: @"(none)", reqFrom, reqTo);
             body = [BABackend handleVideoSegment:inner reqFrom:reqFrom reqTo:reqTo
                                         rangeReq:rangeReq error:NULL];
@@ -1167,7 +1168,7 @@ static void BADeepRewrite(id obj, NSString *keyPath, int depth, NSMutableSet *se
                     @try {
                         [obj setValue:next forKey:pname];
                         NSString *ns = (NSString *)next;
-                        BAEssentialLog(@"rt-rewrite %@: %@",
+                        BAEssentialLog(@"rt-rewrite %{public}@: %{public}@",
                             childPath, [ns substringToIndex:MIN((NSUInteger)90, ns.length)]);
                     } @catch (NSException *e) { (void)e; }
                 }
@@ -1215,7 +1216,7 @@ static Class BAFindReplyClass(NSArray<NSString *> *candidates) {
     for (NSString *name in candidates) {
         Class c = objc_getClass(name.UTF8String);
         if (c) {
-            NSLog(@"[BiliAcc] found reply class: %@", name);
+            NSLog(@"[BiliAcc] found reply class: %{public}@", name);
             return c;
         }
     }
@@ -1268,7 +1269,7 @@ static void BAHookGrpcModels(void) {
             }
         }
         free(classes);
-        NSLog(@"[BiliAcc] no known reply class found; candidates: %@", hits);
+        NSLog(@"[BiliAcc] no known reply class found; candidates: %{public}@", hits);
     }
 }
 
