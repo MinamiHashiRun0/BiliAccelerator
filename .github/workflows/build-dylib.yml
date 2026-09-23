@@ -9,7 +9,20 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests (host macOS, no device needed)
+        run: |
+          mkdir -p build
+          clang -fobjc-arc -O1 -framework Foundation \
+            -DBA_NO_CONSTRUCTOR \
+            tests/test_logic.m -o build/test_logic
+          ./build/test_logic
+
   build:
+    needs: test
     runs-on: macos-14
     permissions:
       contents: write

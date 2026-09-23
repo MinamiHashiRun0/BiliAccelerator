@@ -684,8 +684,8 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
     NSURL *real = [NSURL URLWithString:target];
     if (!real) return nil;
 
-    // 无 Range 头（整文件请求）或 open-ended：探测总大小补全窗口
-    if (reqTo < 0) {
+    // 无 Range 头（整文件请求）或 open-ended 或 suffix range：探测总大小补全窗口
+    if (reqTo < 0 || reqFrom < 0) {
         long long total = [self probeTotalSize:real];
         if (total <= 0) {
             // 探测失败 → 单连接直拉，不带 Range
@@ -702,8 +702,13 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
             dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * NSEC_PER_SEC));
             return body;
         }
-        if (reqFrom < 0) reqFrom = 0;                  // bytes=-456 → suffix range
-        reqTo = total - 1;
+        if (reqTo < 0) {
+            if (reqFrom < 0) reqFrom = 0;      // 无 Range / bytes=a- → 全量或开区间
+            reqTo = total - 1;
+        } else {
+            reqFrom = total - reqTo;           // bytes=-N suffix → [total-N, total-1]
+            reqTo = total - 1;
+        }
     }
 
     long long windowSize = reqTo - reqFrom + 1;
@@ -1302,6 +1307,9 @@ static NSURLSessionDataTask *BAHookDataTask(id self, SEL _cmd, NSURLRequest *req
 
 // constructor 里不能用 BAQuery*（它们依赖 ObjC runtime 完全就绪的时序没问题，
 // 但为了诊断加载失败，先用 C 接口直接读一次 enabled）
+#ifdef BA_NO_CONSTRUCTOR
+static void BiliAccInitUnused(void) { (void)0; }
+#else
 __attribute__((constructor))
 static void BiliAccInit(void) {
     @autoreleasepool {
@@ -1336,4 +1344,5 @@ static void BiliAccInit(void) {
               (long)BAProxyPort(), BAMode(), BATargetHost(), (long)BAConcurrency(), BAVerbose());
     }
 }
+#endif
 
