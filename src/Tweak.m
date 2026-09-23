@@ -859,7 +859,6 @@ static BOOL BAIsPlayviewURL(NSString *u) {
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/mach_init.h>
 #import <libkern/OSCacheControl.h>
 
@@ -939,10 +938,10 @@ static void *BAFindSymbolInMainBinary(const char *symbolName) {
 
 // RWX trampoline：原 16 字节指令 + 跳回 target+16
 static void *BAMakeTrampoline(void *target) {
-    mach_vm_address_t addr = 0;
-    kern_return_t kr = mach_vm_allocate(mach_task_self(), &addr, PAGE_SIZE, VM_FLAGS_ANYWHERE);
+    vm_address_t addr = 0;
+    kern_return_t kr = vm_allocate(mach_task_self(), &addr, PAGE_SIZE, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) return NULL;
-    kr = mach_vm_protect(mach_task_self(), addr, PAGE_SIZE, FALSE,
+    kr = vm_protect(mach_task_self(), addr, PAGE_SIZE, FALSE,
                          VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) return NULL;
 
@@ -975,8 +974,8 @@ static void BAHookCronet(void) {
     }
     BACronetTrampolineBuf = trampoline;
 
-    mach_vm_address_t page = (mach_vm_address_t)target & ~(mach_vm_address_t)PAGE_MASK;
-    kern_return_t kr = mach_vm_protect(mach_task_self(), page, PAGE_SIZE, FALSE,
+    vm_address_t page = (vm_address_t)target & ~(vm_address_t)PAGE_MASK;
+    kern_return_t kr = vm_protect(mach_task_self(), page, PAGE_SIZE, FALSE,
                                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
         NSLog(@"[BiliAcc] vm_protect FAILED: %d", kr);
