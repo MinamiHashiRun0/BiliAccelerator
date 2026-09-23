@@ -1,5 +1,5 @@
 # BiliAccelerator dylib — GitHub Actions 云端编译（无需本地 Mac）
-# 产物：Accelerator/build/BiliAccelerator.dylib（arm64 iOS）
+# 产物：build/BiliAccelerator.dylib（arm64 iOS）
 
 name: build-dylib
 
@@ -16,7 +16,7 @@ jobs:
 
       - name: Compile dylib (arm64 iOS)
         run: |
-          cd Accelerator
+          mkdir -p build
           xcrun -sdk iphoneos clang \
             -arch arm64 \
             -miphoneos-version-min=13.0 \
@@ -33,7 +33,7 @@ jobs:
 
       - name: Fake-sign dylib
         run: |
-          cd Accelerator
+          mkdir -p build
           ldid -S BiliAccelerator.dylib
           codesign -dv BiliAccelerator.dylib || true
           mkdir -p build
@@ -43,13 +43,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: BiliAccelerator.dylib
-          path: Accelerator/build/BiliAccelerator.dylib
+          path: build/BiliAccelerator.dylib
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.1.0
-          files: Accelerator/build/BiliAccelerator.dylib
+          files: build/BiliAccelerator.dylib
           fail_on_unmatched_files: true
           body: |
             BiliAccelerator.dylib v0.1.0
