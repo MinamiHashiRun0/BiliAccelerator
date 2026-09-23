@@ -115,6 +115,9 @@ static BOOL BAVerbose(void) {
     return BAQueryBool(@"BiliAcc_verbose", NO);
 }
 
+// 新系统的 NSLog→os_log 链路对 %{public}s/@ 支持不稳定（输出 "<decode: missing data>"
+// 或字面 "{public}s"）。改用普通格式符：stderr（console-pty/Mac 直跑）下完整可见；
+// Console.app 看到的动态串会被隐私化为 <private>，但行仍在，足以确认时序。
 #define BALog(...) do { if (BAVerbose()) NSLog(@"[BiliAcc] " __VA_ARGS__); } while (0)
 
 // 无条件日志：关键链路前 8 条必打（验证链路不需要用户开 verbose）
@@ -338,7 +341,7 @@ static void BARewriteJsonDeep(NSMutableDictionary *obj, BOOL *changed, NSInteger
             if (next) {
                 obj[key] = next;
                 *changed = YES;
-                BALog(@"json-rewrite %{public}@: %{public}@", key,
+                BALog(@"json-rewrite %@: %@", key,
                       [next substringToIndex:MIN((NSUInteger)100, next.length)]);
             }
         }
@@ -553,8 +556,8 @@ static void BARewriteUrlField(NSData *fieldValue, BAFieldAction *act, BAWalkCtx 
     NSString *next = BARewriteUrlDetail(str, &reason);
     next = BAWrapProxy(next);   // 视频 URL 进本地并发代理（与运行时路径同语义）
     if ([next isEqualToString:str]) return;
-    BALog(@"pb-rewrite %s [%@] → %@", what, reason ?: @"?",
-          [next substringToIndex:MIN((NSUInteger)100, next.length)]);
+    BALog(@"pb-rewrite %s [%s] → %s", what, (reason ?: @"?").UTF8String,
+          [next substringToIndex:MIN((NSUInteger)100, next.length)].UTF8String);
     act->action = 1;
     act->replacement = [NSMutableData dataWithData:[next dataUsingEncoding:NSUTF8StringEncoding]];
     ctx->changed = YES;
@@ -905,7 +908,7 @@ static void BAServeConnection(int conn) {
         if (parts.count < 2) { close(conn); return; }
 
         NSString *path = parts[1];
-        BAEssentialLog(@"conn: %{public}s", path.UTF8String);
+        BAEssentialLog(@"conn: %s", path.UTF8String);
         NSURL *abs = [NSURL URLWithString:[@"http://127.0.0.1" stringByAppendingString:path]];
         NSURL *inner = [BABackend innerURLFor:abs.query ?: @""];
 
@@ -927,7 +930,7 @@ static void BAServeConnection(int conn) {
 
         NSData *body = nil;
         if ([path hasPrefix:@"/seg"]) {
-            BAEssentialLog(@"seg req: Range=%{public}s (from=%lld to=%lld)",
+            BAEssentialLog(@"seg req: Range=%s (from=%lld to=%lld)",
                 (rangeHeader ?: @"(none)").UTF8String, reqFrom, reqTo);
             body = [BABackend handleVideoSegment:inner reqFrom:reqFrom reqTo:reqTo
                                         rangeReq:rangeReq error:NULL];
@@ -1257,7 +1260,7 @@ static void BADeepRewrite(id obj, NSString *keyPath, int depth, NSMutableSet *se
                         [obj setValue:next forKey:pname];
                         NSString *ns = (NSString *)next;
                         NSString *pv = [ns length] > 90 ? [ns substringToIndex:90] : ns;
-                        BAEssentialLog(@"rt-rewrite %{public}s: %{public}s",
+                        BAEssentialLog(@"rt-rewrite %s: %s",
                             childPath ? childPath.UTF8String : "(nil)",
                             pv.UTF8String ?: "");
                     } @catch (NSException *e) { (void)e; }
