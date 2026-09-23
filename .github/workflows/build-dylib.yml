@@ -27,10 +27,8 @@ jobs:
             -O2 \
             -framework Foundation \
             -o BiliAccelerator.dylib \
-            src/Tweak.m src/fishhook.c
+            src/Tweak.m
           file BiliAccelerator.dylib
-          # 确认 Cronet hook 符号已写入
-          nm -gU BiliAccelerator.dylib | grep -i hookcronet || true
 
       - name: Install ldid
         run: brew install ldid
