@@ -4,7 +4,7 @@
 
 #import <Foundation/Foundation.h>
 #import <stdio.h>
-#import "Tweak.m"
+#import "../src/Tweak.m"
 
 static int g_pass = 0, g_fail = 0;
 #define CHECK(cond, name) do { \
