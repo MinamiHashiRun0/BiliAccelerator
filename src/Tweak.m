@@ -14,6 +14,9 @@
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
+#ifdef BA_AUTO_VIDEO
+#import <UIKit/UIKit.h>
+#endif
 
 #pragma mark - 常量
 
@@ -680,6 +683,7 @@ static NSData *BARewriteProtobufBody(NSData *payload, BOOL *changed) {
 // 按字节序拼接后以 HTTP 200 响应给播放器。音频流永远不会路由到这里。
 @interface BAProxy : NSObject
 - (NSURL *)innerURLFor:(NSString *)query;
+- (long long)totalForURL:(NSURL *)url;   // 带缓存的总大小探测（失败返回 -1）
 - (NSData *)handleVideoSegment:(NSURL *)url
                        reqFrom:(long long)reqFrom
                          reqTo:(long long)reqTo
@@ -701,6 +705,11 @@ static BAProxy *BABackend = nil;
             NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
             cfg.HTTPShouldUsePipelining = YES;
             cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+            // 关键：B 站客户端注册了全局 NSURLProtocol（P2P/自有网络层），
+            // 默认配置的请求会被导进其内部状态导致永不回调 —— 必须清空。
+            cfg.protocolClasses = nil;
+            cfg.connectionProxyDictionary = @{};   // 防系统/App 代理把请求送回本地
+            cfg.timeoutIntervalForRequest = 65;
             NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg delegate:nil delegateQueue:nil];
             [_sessions addObject:s];
         }
@@ -722,6 +731,25 @@ static BAProxy *BABackend = nil;
 }
 
 // HEAD/Range-0 探测总大小；失败返回 -1
+- (long long)totalForURL:(NSURL *)url {
+    if (!url) return -1;
+    static NSMutableDictionary *cache;
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [NSMutableDictionary dictionary];
+        q = dispatch_queue_create("biliacc.totalcache", DISPATCH_QUEUE_CONCURRENT);
+    });
+    __block long long cached = -1;
+    dispatch_sync(q, ^{ cached = [cache[url.absoluteString] longLongValue]; });
+    if (cached > 0) return cached;
+    long long t = [self probeTotalSize:url];
+    if (t > 0) {
+        dispatch_barrier_async(q, ^{ cache[url.absoluteString] = @(t); });
+    }
+    return t;
+}
+
 - (long long)probeTotalSize:(NSURL *)real {
     NSMutableURLRequest *probe = [NSMutableURLRequest requestWithURL:real];
     probe.HTTPMethod = @"HEAD";
@@ -752,23 +780,30 @@ static BAProxy *BABackend = nil;
 
 // 单次 Range 拉取（带一次重试），成功返回精确 expect 字节，否则 nil
 - (NSData *)fetchRange:(NSURL *)real from:(long long)from to:(long long)to lane:(NSInteger)lane {
+    long long expect = to - from + 1;
     for (NSInteger attempt = 0; attempt < 2; attempt++) {
         NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:real];
         [rq setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", from, to] forHTTPHeaderField:@"Range"];
         [rq setTimeoutInterval:60];
         __block NSData *d = nil;
+        __block NSInteger status = 0;
+        __block NSError *err = nil;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [[_sessions[lane % _sessions.count] dataTaskWithRequest:rq
             completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
-                (void)r; (void)e;
+                err = e;
+                if ([r isKindOfClass:[NSHTTPURLResponse class]]) status = ((NSHTTPURLResponse *)r).statusCode;
                 d = data;
                 dispatch_semaphore_signal(sem);
             }] resume];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * NSEC_PER_SEC));
-        long long expect = to - from + 1;
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 70LL * NSEC_PER_SEC));
         if (d && (long long)d.length == expect) return d;
-        BALog(@"lane %ld attempt %ld range %lld-%lld got %zu bytes (expect %lld)",
-              (long)lane, (long)attempt, from, to, d ? d.length : 0, expect);
+        // 服务器忽略 Range 回 200 全量：from==0 时直接截断前 expect 字节
+        if (status == 200 && from == 0 && d && (long long)d.length >= expect)
+            return [d subdataWithRange:NSMakeRange(0, (NSUInteger)expect)];
+        BAEssentialLog(@"lane %ld attempt %ld range %lld-%lld status=%ld got %zu bytes (expect %lld) err=%@",
+              (long)lane, (long)attempt, from, to, (long)status, d ? d.length : 0, expect,
+              err.localizedDescription ?: @"(none)");
     }
     return nil;
 }
@@ -819,7 +854,7 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
                     body = d; if (err) *err = e;
                     dispatch_semaphore_signal(sem);
                 }] resume];
-            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * NSEC_PER_SEC));
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 70LL * NSEC_PER_SEC));
             return body;
         }
         if (reqTo < 0) {
@@ -837,20 +872,9 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
     if (windowSize < 1024 * 1024 || lanes <= 1) {
         BAEssentialLog(@"seg: window %lld-%lld (%lldKB) single connection",
               reqFrom, reqTo, windowSize / 1024);
-        NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:real];
-        [rq setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", reqFrom, reqTo]
-            forHTTPHeaderField:@"Range"];
-        [rq setTimeoutInterval:60];
-        __block NSData *body = nil;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [[_sessions[0] dataTaskWithRequest:rq
-            completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-                body = d; if (err) *err = e;
-                dispatch_semaphore_signal(sem);
-            }] resume];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * NSEC_PER_SEC));
-        if (body && (long long)body.length == windowSize) return body;
-        return body;   // 长度不符也返回（有些服务器忽略 Range 返回 200 全量）
+        NSData *body = [self fetchRange:real from:reqFrom to:reqTo lane:0];
+        if (body) BAEssentialLog(@"seg: window done %lld bytes", (long long)body.length);
+        return body;
     }
 
     // 把窗口均分成 lanes 段（尾段余量并入最后一段）
@@ -906,7 +930,7 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
             body = d; if (err) *err = e;
             dispatch_semaphore_signal(sem);
         }] resume];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * NSEC_PER_SEC));
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 70LL * NSEC_PER_SEC));
     return body;
 }
 
@@ -973,15 +997,27 @@ static void BAServeConnection(int conn) {
         }
 
         // 有 Range 请求 → 回 206 + Content-Range；无 → 200
+        // IJKPlayer 需要 Content-Range 带总长度（/* 会让 demuxer 无法确定文件大小而重启）
         NSString *hdr;
         if (rangeReq && reqFrom >= 0) {
-            hdr = [NSString stringWithFormat:
-                @"HTTP/1.1 206 Partial Content\r\n"
-                 "Content-Type: application/octet-stream\r\n"
-                 "Content-Range: bytes %lld-%lld/*\r\n"
-                 "Content-Length: %zu\r\n"
-                 "Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                reqFrom, reqFrom + (long long)body.length - 1, body.length];
+            long long total = [BABackend totalForURL:inner];
+            if (total > 0) {
+                hdr = [NSString stringWithFormat:
+                    @"HTTP/1.1 206 Partial Content\r\n"
+                     "Content-Type: application/octet-stream\r\n"
+                     "Content-Range: bytes %lld-%lld/%lld\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    reqFrom, reqFrom + (long long)body.length - 1, total, body.length];
+            } else {
+                hdr = [NSString stringWithFormat:
+                    @"HTTP/1.1 206 Partial Content\r\n"
+                     "Content-Type: application/octet-stream\r\n"
+                     "Content-Range: bytes %lld-%lld/*\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    reqFrom, reqFrom + (long long)body.length - 1, body.length];
+            }
         } else {
             hdr = [NSString stringWithFormat:
                 @"HTTP/1.1 200 OK\r\n"
@@ -1004,7 +1040,7 @@ static void BAServeConnection(int conn) {
 
 static void BAStartLocalServer(NSInteger port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return;
+    if (fd < 0) { BAEssentialLog(@"server: socket() failed errno=%d", errno); return; }
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     struct sockaddr_in addr;
@@ -1012,9 +1048,13 @@ static void BAStartLocalServer(NSInteger port) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // 仅本机可达
     addr.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(fd); return; }
-    if (listen(fd, 16) != 0) { close(fd); return; }
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        BAEssentialLog(@"server: bind() failed errno=%d (port %ld 被占用?)", errno, (long)port);
+        close(fd); return;
+    }
+    if (listen(fd, 16) != 0) { BAEssentialLog(@"server: listen() failed errno=%d", errno); close(fd); return; }
     BAListenFD = fd;
+    BAEssentialLog(@"server: listening on 127.0.0.1:%ld fd=%d", (long)port, fd);
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         while (BAListenFD >= 0) {
@@ -1455,6 +1495,16 @@ static void BiliAccInit(void) {
 
         BAEssentialLog(@"loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld, verbose=%d",
               (long)BAProxyPort(), BAMode(), BATargetHost(), (long)BAConcurrency(), BAVerbose());
+#ifdef BA_AUTO_VIDEO
+        // 测试模式：启动后自动跳进指定视频（真机无 openurl，进程内自唤起）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12LL * NSEC_PER_SEC),
+            dispatch_get_main_queue(), ^{
+                NSURL *u = [NSURL URLWithString:@"bilibili://video/41963095721"];
+                [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:^(BOOL ok) {
+                    BAEssentialLog(@"auto-video openURL ok=%d", ok);
+                }];
+            });
+#endif
     }
 }
 #endif
