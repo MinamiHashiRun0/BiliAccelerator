@@ -286,19 +286,9 @@ static void BARewriteDashContainer(NSDictionary *container, BOOL *changed) {
                     NSString *reason = nil;
                     NSString *next = BARewriteUrlDetail(val, &reason);
                     if (![next isEqualToString:val]) {
-                        BALog(@"json-rewrite [%@] %@: %@ → %@", kind, reason,
-                              [val substringToIndex:MIN((NSUInteger)120, val.length)],
+                        BALog(@"json-rewrite [%@] %@: %@", kind, reason,
                               [next substringToIndex:MIN((NSUInteger)120, next.length)]);
                         entry[key] = next;
-                        *changed = YES;
-                    }
-                    // 视频流走本地并发代理；音频(dash.audio)永远不改
-                    if ([kind isEqualToString:@"video"] && BAConcurrency() > 1) {
-                        entry[key] = [NSString stringWithFormat:@"http://127.0.0.1:%ld/seg?u=%@",
-                            (long)BAProxyPort(),
-                            [next stringByAddingPercentEncodingWithAllowedCharacters:
-                                       [[NSCharacterSet alphanumericCharacterSet] invertedSet]]];
-                        BALog(@"video → local proxy (lanes=%ld)", (long)BAConcurrency());
                         *changed = YES;
                     }
                 }
@@ -317,37 +307,23 @@ static void BARewriteDashContainer(NSDictionary *container, BOOL *changed) {
     }
 }
 
-static void BARewriteValueDeep(id value, BOOL *changed, NSInteger depth) {
-    if (depth > 20 || !value) return;
-    if ([value isKindOfClass:[NSMutableDictionary class]] || [value isKindOfClass:[NSDictionary class]]) {
-        BARewriteDashContainer(value, changed);
-        for (NSString *key in ((NSDictionary *)value)) {
-            BARewriteValueDeep(value[key], changed, depth + 1);
-        }
-    } else if ([value isKindOfClass:[NSArray class]]) {
-        for (id item in value) BARewriteValueDeep(item, changed, depth + 1);
-    }
-}
+#pragma mark - Protobuf 改写（gRPC 响应字节流，按官方 schema 寻址）
 
-static NSString *BARewriteJsonPayload(NSString *json, BOOL *changed) {
-    *changed = NO;
-    NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
-    if (!data) return json;
-    id root = [NSJSONSerialization JSONObjectWithData:data
-                                              options:NSJSONReadingMutableContainers
-                                                error:NULL];
-    if (!root) return json;
-    BARewriteValueDeep(root, changed, 0);
-    if (!*changed) return json;
-    NSData *out = [NSJSONSerialization dataWithJSONObject:root options:0 error:NULL];
-    return out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : json;
-}
+// 结构依据 bilibili-API-collect 反编译官方 App 的 com.bapis 定义（docs/*.proto）：
+//   PlayViewUniteReply (bilibili.app.playerunite.v1)
+//     1: playershared.VodInfo
+//          5: repeated Stream stream_list
+//               Stream { 1: StreamInfo; oneof { 2: DashVideo | 3: SegmentVideo } }
+//               DashVideo { 1: base_url; 2: backup_url }   ← 视频流，改
+//          6: repeated DashItem dash_audio                  ← 音频流，绝不碰
+//          7: DolbyItem dolby / 9: LossLessItem             ← 杜比/Hi-Res 音频，不碰
+//   PlayViewReply (bilibili.app.playurl.v1)
+//     1: VideoInfo { 8: repeated ResponseUrl durl; 9: ResponseDash }
+//          ResponseDash { 1: repeated DashItem video; 2: audio } ← 只碰 video
+//
+// 字段号是唯一的寻址方式，不再做 "http" 字符串盲扫——盲扫无法区分
+// VideoInfo 里分离的 video/audio，两代 proto 字段号也不同。
 
-#pragma mark - Protobuf 改写（gRPC 响应字节流）
-
-// gRPC 响应是 [1 byte compress flag][4 byte big-endian length][protobuf bytes]
-// protobuf 里 URL 均为 length-delimited string 字段。我们扫描 "http"，
-// 仅当长度前缀(varint)与 URL 字节长匹配时才替换，重建 varint 前缀。
 static NSUInteger BAReadVarint(const uint8_t *b, NSUInteger len, NSUInteger *outLen) {
     NSUInteger v = 0, shift = 0, i = 0;
     while (i < len && shift < 63) {
@@ -370,65 +346,208 @@ static void BAWriteVarint(NSMutableData *d, NSUInteger v) {
     [d appendBytes:&c length:1];
 }
 
-static NSData *BARewriteProtobufBody(NSData *data, BOOL *changed) {
-    *changed = NO;
-    if (data.length < 8 || !BAEnabled()) return data;
+// protobuf wire type
+#define BA_WT_VARINT 0
+#define BA_WT_64BIT  1
+#define BA_WT_LEN    2
+#define BA_WT_32BIT  5
 
-    NSMutableData *out = [NSMutableData dataWithCapacity:data.length + 1024];
-    const uint8_t *b = data.bytes;
-    NSUInteger len = data.length, i = 0;
+// ---- 通用 protobuf 重建器 ----
+// 逐字段遍历 message 字节。对每个 wire-type-2 字段调用 classify 回调：
+//   outAction: 0=原样拷贝  1=用 outReplacement 替换该字段值  2=内容是子消息，递归同一 classify
+// 每层 schema 用独立 classify 函数表达，递归时由 schema 树上的位置决定用哪个。
 
-    NSData *needle = [@"http" dataUsingEncoding:NSUTF8StringEncoding];
-    while (i < len) {
-        NSRange r = [data rangeOfData:needle options:0 range:NSMakeRange(i, len - i)];
-        if (r.location == NSNotFound) {
-            [out appendBytes:b + i length:len - i];
-            break;
-        }
-        NSUInteger hStart = r.location;
-        // 向前扫 varint 长度前缀：尝试 "http" 在字段值内出现的所有可能 varint 起点不好判定，
-        // 更稳妥的做法是：向前回退最多 2 字节尝试 varint 解码，验证字段长度覆盖到 ASCII 结尾。
-        BOOL matched = NO;
-        for (uint8_t back = 1; back <= 2 && !matched; back++) {
-            if (hStart < back) continue;
-            NSUInteger lpos = hStart - back;
-            NSUInteger fieldLen = 0;
-            NSUInteger hdr = BAReadVarint(b + lpos, hStart - lpos + 1, &fieldLen);
-            if (hdr != back) continue;             // varint 必须恰好终止于 "http" 前
-            if (fieldLen < 20 || fieldLen > 4096) continue;
-            NSUInteger fieldEnd = lpos + hdr + fieldLen;
-            if (fieldEnd > len) continue;
-            if (b[lpos + hdr] != 'h') continue;    // 长度前缀必须紧跟 "http"，防止误判命中切片中部
-            NSData *s = [data subdataWithRange:NSMakeRange(lpos + hdr, fieldLen)];
-            NSString *str = [[NSString alloc] initWithData:s encoding:NSUTF8StringEncoding];
-            if (!str || ![str hasPrefix:@"http"]) continue;
-            NSURL *u = [NSURL URLWithString:str];
-            if (!u || !BAIsMediaURL(u)) continue;
-            NSString *reason = nil;
-            NSString *next = BARewriteUrlDetail(str, &reason);
-            if ([next isEqualToString:str]) continue;
-            BALog(@"pb-rewrite [%@] %@ → %@", reason,
-                  [str substringToIndex:MIN((NSUInteger)120, str.length)],
-                  [next substringToIndex:MIN((NSUInteger)120, next.length)]);
+typedef struct {
+    uint8_t action;                 // 0 copy / 1 replace / 2 recurse
+    NSMutableData *replacement;     // action=1 时：新的字段值（不含 tag/len）
+} BAFieldAction;
 
-            // 保留 lpos 之前字节，重建 varint 长度前缀 + 新 URL 内容
-            [out appendBytes:b + i length:lpos - i];
-            BAWriteVarint(out, next.length);
-            [out appendData:[next dataUsingEncoding:NSUTF8StringEncoding]];
-            *changed = YES;
-            i = fieldEnd;
-            matched = YES;
-        }
-        if (!matched) {
-            // 非 URL 字段，原样拷贝到下一个 http 之后（含"http"本身）
-            [out appendBytes:b + i length:hStart + 4 - i];
-            i = hStart + 4;
-        }
+typedef void (*BAFieldClassify)(uint32_t field, NSData *fieldValue,
+                                BAFieldAction *action, void *ctx);
+
+// 改写上下文：schema 层级游走
+typedef struct {
+    BOOL changed;
+    NSInteger level;      // 当前 schema 层级（枚举 BA_S_*）
+    NSInteger savedLevel; // 递归返回后恢复用
+} BAWalkCtx;
+
+// 递归序列化：把 [start,end) 的 message 按字段遍历，classify 决定每字段去向。
+static void BASerializeMessage(NSData *data, NSUInteger start, NSUInteger end,
+                               BAFieldClassify classify, void *ctx,
+                               NSMutableData *out, NSInteger depth) {
+    if (depth > 12 || end <= start) {
+        [out appendBytes:(const uint8_t *)data.bytes + start length:end - start];
+        return;
     }
-    return out;
+    const uint8_t *b = (const uint8_t *)data.bytes;
+    NSUInteger i = start;
+    while (i < end) {
+        NSUInteger tagStart = i;
+        uint64_t tag = 0;
+        NSUInteger tagLen = BAReadVarint(b + i, end - i, &tag);
+        if (tagLen == 0 || i + tagLen > end) { [out appendBytes:b+tagStart length:end-i]; return; }
+        i += tagLen;
+        uint32_t fieldNum = (uint32_t)(tag >> 3);
+        uint32_t wt = (uint32_t)(tag & 7);
+
+        NSUInteger valueStart = i;
+        NSUInteger fieldEnd = 0;
+        switch (wt) {
+            case BA_WT_VARINT: {
+                uint64_t v = 0;
+                NSUInteger vl = BAReadVarint(b + i, end - i, &v);
+                if (vl == 0) { [out appendBytes:b+tagStart length:end-i]; return; }
+                fieldEnd = i + vl;
+                break;
+            }
+            case BA_WT_64BIT: fieldEnd = i + 8; break;
+            case BA_WT_32BIT: fieldEnd = i + 4; break;
+            case BA_WT_LEN: {
+                uint64_t flen = 0;
+                NSUInteger fl = BAReadVarint(b + i, end - i, &flen);
+                if (fl == 0 || i + fl + flen > end) { [out appendBytes:b+tagStart length:end-i]; return; }
+                fieldEnd = i + fl + (NSUInteger)flen;
+                break;
+            }
+            default:
+                // 未知 wire type（3/4 group）：整体拷贝剩余，防御
+                [out appendBytes:b+tagStart length:end-i];
+                return;
+        }
+        if (fieldEnd > end) { [out appendBytes:b+tagStart length:end-i]; return; }
+
+        BAFieldAction act = {0, nil};
+        if (wt == BA_WT_LEN) {
+            NSData *value = [data subdataWithRange:NSMakeRange(valueStart, fieldEnd - valueStart)];
+            classify(fieldNum, value, &act, ctx);
+        }
+
+        switch (act.action) {
+            case 1: {  // 字段值替换：重写 tag + varint(len) + 新值
+                BAWriteVarint(out, ((uint64_t)fieldNum << 3) | BA_WT_LEN);
+                BAWriteVarint(out, act.replacement.length);
+                [out appendData:act.replacement];
+                break;
+            }
+            case 2: {  // 子消息递归
+                // classify 在 act 里已写入下一层 level（ctx.savedLevel 保存当前层），
+                // 递归前后切换游走层级，兄弟字段层级不变
+                BAWalkCtx *wctx = (BAWalkCtx *)ctx;
+                NSInteger saved = wctx->savedLevel;   // classify 已把 savedLevel=当前层
+                NSMutableData *sub = [NSMutableData dataWithCapacity:fieldEnd - valueStart + 64];
+                BASerializeMessage(data, valueStart, fieldEnd, classify, ctx, sub, depth + 1);
+                wctx->level = saved;                  // 递归返回，恢复本层
+                BAWriteVarint(out, ((uint64_t)fieldNum << 3) | BA_WT_LEN);
+                BAWriteVarint(out, sub.length);
+                [out appendData:sub];
+                break;
+            }
+            default:   // 原样拷贝（tag 起，到字段末尾）
+                [out appendBytes:b+tagStart length:fieldEnd - tagStart];
+                break;
+        }
+        i = fieldEnd;
+    }
 }
 
-#pragma mark - 本地并发下载代理
+// 通用 URL 字段改写：fieldValue 是 LEN 字段的纯内容（UTF-8 字符串）
+static void BARewriteUrlField(NSData *fieldValue, BAFieldAction *act, BAWalkCtx *ctx, const char *what) {
+    NSString *str = [[NSString alloc] initWithData:fieldValue encoding:NSUTF8StringEncoding];
+    if (!str || ![str hasPrefix:@"http"]) return;
+    NSString *reason = nil;
+    NSString *next = BARewriteUrlDetail(str, &reason);
+    if ([next isEqualToString:str]) return;
+    BALog(@"pb-rewrite %s [%@] → %@", what, reason ?: @"?",
+          [next substringToIndex:MIN((NSUInteger)100, next.length)]);
+    act->action = 1;
+    act->replacement = [NSMutableData dataWithData:[next dataUsingEncoding:NSUTF8StringEncoding]];
+    ctx->changed = YES;
+}
+
+// ---- schema 层 classify ----
+// 一个 message 内的兄弟字段可能类型不同，但 protobuf 递归时 classify 只有一个 ——
+// 所以把 schema 树编进单个 classify：用 ctx 携带当前递归路径。
+// 路径枚举（与 docs/*.proto 对应）：
+//   S_TOP=0   顶层 PlayViewUniteReply / PlayViewReply
+//   S_VOD=1   VodInfo / VideoInfo
+//   S_STREAM=2  Stream (VodInfo.5)
+//   S_DASH=3    ResponseDash (VideoInfo.9)
+//   S_ENTRY=4   DashVideo(Stream.2) / DashItem(dash.video) / ResponseUrl(durl/segment)
+//   S_SEG=5     SegmentVideo(Stream.3) → 内部 ResponseUrl
+
+enum {
+    BA_S_TOP = 0, BA_S_VOD, BA_S_STREAM, BA_S_DASH, BA_S_ENTRY, BA_S_SEG
+};
+
+// 每层递归用子 ctx 指定下一层 level
+static void BASchemaClassify(uint32_t field, NSData *value, BAFieldAction *act, void *vctx) {
+    BAWalkCtx *ctx = (BAWalkCtx *)vctx;
+    NSInteger childLevel = -1;   // -1 = 不递归
+    switch (ctx->level) {
+        case BA_S_TOP:
+            // PlayViewUniteReply.1=VodInfo；PlayViewReply.1=VideoInfo
+            if (field == 1) childLevel = BA_S_VOD;
+            break;
+
+        case BA_S_VOD:
+            // VodInfo: 5=stream_list(Stream) 6=dash_audio 7=dolby 9=loss_less_item
+            // VideoInfo: 8=durl(ResponseUrl) 9=dash(ResponseDash)
+            if (field == 5)      childLevel = BA_S_STREAM;
+            else if (field == 9) childLevel = BA_S_DASH;
+            else if (field == 8) childLevel = BA_S_ENTRY;   // durl 的 ResponseUrl
+            // 6=dash_audio / 7=dolby / 9(vod)=loss_less_item / 标量 → 原样（音频不动）
+            break;
+
+        case BA_S_STREAM:
+            // Stream: 2=DashVideo 3=SegmentVideo；1=StreamInfo 原样
+            if (field == 2) childLevel = BA_S_ENTRY;  // DashVideo 的 URL 字段
+            else if (field == 3) childLevel = BA_S_SEG;
+            break;
+
+        case BA_S_DASH:
+            // ResponseDash: 1=video(DashItem) 2=audio(DashItem)
+            if (field == 1) childLevel = BA_S_ENTRY;  // 仅视频分支递归
+            // field==2 (audio) → 原样，绝不递归
+            break;
+
+        case BA_S_SEG:
+            // SegmentVideo: 1=repeated ResponseUrl
+            if (field == 1) childLevel = BA_S_ENTRY;
+            break;
+
+        case BA_S_ENTRY:
+            // DashItem: 2=base_url 3=backup_url
+            // DashVideo: 1=base_url 2=backup_url
+            // ResponseUrl: 4=url 5=backup_url
+            if (field == 1 || field == 2 || field == 3 || field == 4 || field == 5) {
+                BARewriteUrlField(value, act, ctx, "dash");
+            }
+            break;
+    }
+    if (childLevel >= 0 && act->action == 2) {
+        // 递归前：保存当前层，切到子层。BASerializeMessage 的 action=2 分支
+        // 递归返回后会用 savedLevel 恢复本层，保证兄弟字段层级正确。
+        ctx->savedLevel = ctx->level;
+        ctx->level = childLevel;
+    }
+}
+
+// gRPC 帧内 protobuf payload → 按官方 schema 改写视频流 URL（音频路径不进入）
+static NSData *BARewriteProtobufBody(NSData *payload, BOOL *changed) {
+    *changed = NO;
+    if (!BAEnabled() || payload.length < 4) return payload;
+
+    BAWalkCtx ctx = {0};
+    ctx.level = BA_S_TOP;
+
+    NSMutableData *out = [NSMutableData dataWithCapacity:payload.length + 256];
+    BASerializeMessage(payload, 0, payload.length, BASchemaClassify, &ctx, out, 0);
+
+    if (!ctx.changed) return payload;
+    *changed = YES;
+    return out;
+}
 
 // 视频流并发下载器：对 /seg?u=<url> 请求，向真实 CDN 发起 N 路 Range 并发，
 // 按字节序拼接后以 HTTP 200 响应给播放器。音频流永远不会路由到这里。
@@ -723,7 +842,44 @@ static BOOL BAIsPlayviewURL(NSString *u) {
            [u containsString:@"x/player"];
 }
 
-#pragma mark - Hook：NSURLSession dataTaskWithRequest:completionHandler:
+#pragma mark - Hook：Cronet（官方客户端 gRPC/图片走内嵌 Cronet，不经过 NSURLSession）
+
+// B 站 iOS 客户端内嵌 Chromium Cronet。
+// gRPC 请求（PlayViewUnite 等）与媒体分片都从 Cronet 发出。
+// Cronet 的 C API 是稳定导出符号（Cronet_UrlRequest_InitWithParams 等），
+// dylib 里直接 fishhook 拦截请求发起点：媒体 URL 请求前改写主机/路由到本地并发代理。
+#include "fishhook.h"
+
+static const void * (*BAOrigCronetInit)(void *self,
+                                        const char *url,
+                                        const char *method,
+                                        void *callback,
+                                        void *params);
+
+static const void * BAHookCronetInit(void *self, const char *url, const char *method,
+                                     void *callback, void *params) {
+    NSString *u = url ? [NSString stringWithUTF8String:url] : nil;
+    if (BAEnabled() && u && BAIsMediaURL([NSURL URLWithString:u]) && !BAIsLiveMedia([NSURL URLWithString:u])) {
+        NSString *reason = nil;
+        NSString *next = BARewriteUrlDetail(u, &reason);
+        if (![next isEqualToString:u]) {
+            BALog(@"cronet-media [%@] → %@", reason ?: @"?",
+                  [next substringToIndex:MIN((NSUInteger)120, next.length)]);
+            url = [next UTF8String];   // next 由 ARC 生命周期持有到 init 调用结束
+        }
+    }
+    return BAOrigCronetInit(self, url, method, callback, params);
+}
+
+static void BAHookCronet(void) {
+    // 官方客户端把 Cronet 静态链接进来，符号在本进程镜像内，
+    // fishhook rebind 名 "Cronet_UrlRequest_InitWithParams" 即可拦截。
+    rebind_symbols((struct rebinding[1]){{
+        "Cronet_UrlRequest_InitWithParams",
+        (void *)BAHookCronetInit,
+        (void **)&BAOrigCronetInit
+    }}, 1);
+}
 
 static NSURLSessionDataTask * (*BAOrigDataTask)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
 
@@ -764,6 +920,7 @@ static void BiliAccInit(void) {
         BAStartLocalServer(BAProxyPort());
 
         // swizzle NSURLSession dataTaskWithRequest:completionHandler:
+        // （兜底路径：部分旧版本/特定接口仍走 NSURLSession）
         Method m = class_getInstanceMethod([NSURLSession class],
                                            @selector(dataTaskWithRequest:completionHandler:));
         if (m) {
@@ -771,6 +928,9 @@ static void BiliAccInit(void) {
                 method_getImplementation(m);
             method_setImplementation(m, (IMP)BAHookDataTask);
         }
+
+        // 拦截 Cronet —— 官方客户端 gRPC/媒体主路径
+        BAHookCronet();
         NSLog(@"[BiliAcc] loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld, verbose=%d",
               (long)BAProxyPort(), BAMode(), BATargetHost(), (long)BAConcurrency(), BAVerbose());
     }
