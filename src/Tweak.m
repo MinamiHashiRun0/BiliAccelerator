@@ -2152,26 +2152,13 @@ static BADebugPanel *BADebugShared = nil;
         self.layer.borderColor = [UIColor systemPinkColor].CGColor;
         [self setTitle:@"B" forState:UIControlStateNormal];
         self.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-            initWithTarget:self action:@selector(dragged:)];
-        [self addGestureRecognizer:pan];
+        // 无任何手势（用户要求）：按钮固定位置，仅支持点击开合面板
         [self addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
     }
     return self;
 }
-- (void)dragged:(UIPanGestureRecognizer *)g {
-    // 窗口即按钮大小：拖动窗口本身
-    UIWindow *w = self.window;
-    CGPoint t = [g translationInView:nil];
-    CGRect f = w.frame;
-    CGRect sb = [UIScreen mainScreen].bounds;
-    CGRect nf = CGRectMake(MIN(MAX(f.origin.x + t.x, 4), sb.size.width - f.size.width - 4),
-                           MIN(MAX(f.origin.y + t.y, 60), sb.size.height - 100),
-                           f.size.width, f.size.height);
-    w.frame = nf;
-    self.frame = w.bounds;
-    [g setTranslation:CGPointZero inView:nil];
-}
+// 拖动手势已移除（双击点赞时与系统手势冲突导致崩溃）——按钮位置固定
+
 - (void)tapped {
     BAEssentialLog(@"floating button TAPPED (visible=%d)", (int)[BADebugPanel shared].isPanelVisible);
     BADebugPanel *p = [BADebugPanel shared];
