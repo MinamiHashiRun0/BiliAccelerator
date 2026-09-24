@@ -14,8 +14,11 @@
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
-#ifdef BA_AUTO_VIDEO
+#if __has_include(<UIKit/UIKit.h>)
 #import <UIKit/UIKit.h>
+#define BA_HAS_UI 1
+#else
+#define BA_HAS_UI 0
 #endif
 
 #pragma mark - 常量
@@ -1858,6 +1861,232 @@ static void BARuntimeDump(void) {
     free(classes);
 }
 
+
+#if BA_HAS_UI
+#pragma mark - 悬浮调试窗（日志尾随 + 功能开关，全部写 CFPreferences 即时生效）
+
+static void BAPrefSet(NSString *key, id v) {
+    CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)v,
+                             (__bridge CFStringRef)kDomain);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)kDomain);
+}
+
+@interface BADebugPanel : NSObject <UITextFieldDelegate>
++ (instancetype)shared;
+- (void)show;
+- (void)hide;
+@end
+
+static UIWindow *BAOverlayWin = nil;
+static BADebugPanel *BADebugShared = nil;
+
+@implementation BADebugPanel {
+    UIView *_panel;
+    UITextView *_logView;
+    UISwitch *_swEnabled, *_swOverlay;
+    UISegmentedControl *_segMode;
+    UILabel *_lblLanes;
+    NSTimer *_tailTimer;
+}
+
++ (instancetype)shared {
+    if (!BADebugShared) BADebugShared = [[self alloc] init];
+    return BADebugShared;
+}
+
+- (UIWindow *)ensureWindow {
+    if (BAOverlayWin) return BAOverlayWin;
+    BAOverlayWin = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 320, 420)];
+    BAOverlayWin.windowLevel = UIWindowLevelAlert + 100;
+    BAOverlayWin.hidden = YES;
+    BAOverlayWin.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
+    BAOverlayWin.layer.cornerRadius = 12;
+    BAOverlayWin.layer.masksToBounds = YES;
+    _panel = [[UIView alloc] initWithFrame:BAOverlayWin.bounds];
+    _panel.backgroundColor = [UIColor clearColor];
+    [BAOverlayWin addSubview:_panel];
+    return BAOverlayWin;
+}
+
+- (void)buildUI {
+    UIWindow *w = [self ensureWindow];
+    if (_panel && _panel.superview) return;   // 只构建一次
+    CGFloat wpx = w.bounds.size.width, x = 12, cw = wpx - 24;
+    CGFloat y = 8;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(x, y, cw - 30, 22)];
+    title.text = @"BiliAccelerator";
+    title.textColor = [UIColor systemPinkColor];
+    title.font = [UIFont boldSystemFontOfSize:15];
+    [_panel addSubview:title];
+
+    UIButton *close = [[UIButton alloc] initWithFrame:CGRectMake(wpx - 34, y, 28, 22)];
+    [close setTitle:@"✕" forState:UIControlStateNormal];
+    close.titleLabel.font = [UIFont systemFontOfSize:14];
+    close.tintColor = UIColor.whiteColor;
+    [close setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [close addTarget:self action:@selector(hide) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:close];
+
+    y += 30;
+    _swEnabled = [[UISwitch alloc] initWithFrame:CGRectMake(wpx - 60, y, 51, 31)];
+    _swEnabled.on = BAEnabled();
+    [_swEnabled addTarget:self action:@selector(toggleEnabled:)
+         forControlEvents:UIControlEventValueChanged];
+    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(x, y + 3, 120, 24)];
+    l1.text = @"启用加速"; l1.textColor = UIColor.whiteColor;
+    l1.font = [UIFont systemFontOfSize:13];
+    [_panel addSubview:l1]; [_panel addSubview:_swEnabled];
+
+    y += 44;
+    _segMode = [[UISegmentedControl alloc] initWithItems:@[@"bad-only", @"force", @"off"]];
+    _segMode.frame = CGRectMake(x, y, cw, 30);
+    NSString *m = BAMode();
+    _segMode.selectedSegmentIndex = [m isEqualToString:@"force"] ? 1 : ([m isEqualToString:@"off"] ? 2 : 0);
+    [_segMode addTarget:self action:@selector(changeMode:) forControlEvents:UIControlEventValueChanged];
+    [_panel addSubview:_segMode];
+
+    y += 44;
+    UIStepper *st = [[UIStepper alloc] initWithFrame:CGRectMake(wpx - 110, y, 94, 29)];
+    st.minimumValue = 1; st.maximumValue = 16; st.stepValue = 1;
+    st.value = BAConcurrency();
+    [st addTarget:self action:@selector(changeLanes:) forControlEvents:UIControlEventValueChanged];
+    _lblLanes = [[UILabel alloc] initWithFrame:CGRectMake(x, y + 3, 140, 24)];
+    _lblLanes.text = [NSString stringWithFormat:@"并发路数: %ld", (long)BAConcurrency()];
+    _lblLanes.textColor = UIColor.whiteColor; _lblLanes.font = [UIFont systemFontOfSize:13];
+    _lblLanes.tag = 99;
+    [_panel addSubview:_lblLanes]; [_panel addSubview:st];
+
+    y += 44;
+    _swOverlay = [[UISwitch alloc] initWithFrame:CGRectMake(wpx - 60, y, 51, 31)];
+    _swOverlay.on = YES;
+    [_swOverlay addTarget:self action:@selector(toggleOverlay:) forControlEvents:UIControlEventValueChanged];
+    UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(x, y + 3, 160, 24)];
+    l2.text = @"显示悬浮按钮"; l2.textColor = UIColor.whiteColor;
+    l2.font = [UIFont systemFontOfSize:13];
+    [_panel addSubview:l2]; [_panel addSubview:_swOverlay];
+
+    y += 42;
+    _logView = [[UITextView alloc] initWithFrame:CGRectMake(x, y, cw, w.bounds.size.height - y - 12)];
+    _logView.editable = NO;
+    _logView.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.55 alpha:1];
+    _logView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
+    _logView.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    [_panel addSubview:_logView];
+
+    // 日志尾随定时器
+    __weak typeof(self) ws = self;
+    _tailTimer = [NSTimer timerWithTimeInterval:1.0
+        target:self selector:@selector(refreshLog) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:_tailTimer forMode:NSRunLoopCommonModes];
+    (void)ws;
+}
+
+- (void)toggleEnabled:(UISwitch *)s { BAPrefSet(@"BiliAcc_enabled", @(s.on)); }
+- (void)changeMode:(UISegmentedControl *)seg {
+    BAPrefSet(@"BiliAcc_mode", @[@"bad-only", @"force", @"off"][(NSUInteger)seg.selectedSegmentIndex]);
+}
+- (void)changeLanes:(UIStepper *)st {
+    BAPrefSet(@"BiliAcc_concurrency", @(st.value));
+    _lblLanes.text = [NSString stringWithFormat:@"并发 %ld", (long)(NSInteger)st.value];
+}
+
+- (void)refreshLog {
+    if (!BAOverlayWin || BAOverlayWin.hidden || !_logView) return;
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"BiliAcc.log"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!fh) return;
+    NSDictionary *attr = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+    unsigned long long size = attr ? attr.fileSize : 0;
+    unsigned long long off = size > 6000 ? size - 6000 : 0;
+    [fh seekToFileOffset:off];
+    NSData *d = [fh readDataToEndOfFile]; [fh closeFile];
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BOOL atBottom = _logView.contentOffset.y + _logView.bounds.size.height >= _logView.contentSize.height - 40;
+        [_logView setText:s];
+        if (atBottom) {
+            NSRange r = NSMakeRange(_logView.text.length, 0);
+            [_logView scrollRangeToVisible:r];
+        }
+    });
+}
+
+- (void)show {
+    [self buildUI];
+    BAOverlayWin.hidden = NO;
+    [BAOverlayWin makeKeyAndVisible];
+}
+
+- (void)hide { if (BAOverlayWin) BAOverlayWin.hidden = YES; }
+
+@end
+
+@interface BAPassthroughWindow : UIWindow @end
+@implementation BAPassthroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    // 落在窗口自身/根视图背景上 → 穿透给 App；落在按钮上 → 正常接收
+    return (hit == self || hit == self.subviews.firstObject) ? nil : hit;
+}
+@end
+
+// 悬浮小圆钮（可拖动，点击开关面板）
+@interface BAFloatingButton : UIButton
+@property(nonatomic, strong) BADebugPanel *panel;
+@end
+@implementation BAFloatingButton
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.75];
+        self.layer.cornerRadius = 16;
+        self.layer.masksToBounds = YES;
+        self.layer.borderWidth = 1;
+        self.layer.borderColor = [UIColor systemPinkColor].CGColor;
+        [self setTitle:@"B" forState:UIControlStateNormal];
+        self.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:self action:@selector(dragged:)];
+        [self addGestureRecognizer:pan];
+        [self addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
+}
+- (void)dragged:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:self.superview];
+    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
+    [g setTranslation:CGPointZero inView:self.superview];
+}
+- (void)tapped {
+    UIWindow *ov = BAOverlayWin;
+    if (ov && !ov.hidden) [[BADebugPanel shared] hide];
+    else [[BADebugPanel shared] show];
+}
+@end
+
+static UIWindow *BAFloatWin = nil;
+
+static void BAShowOverlay(void) {
+    if (!BAEnabled()) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            if (BAFloatWin) return;
+            UIWindow *win = [UIApplication sharedApplication].windows.firstObject;
+            CGRect fb = win ? win.bounds : CGRectMake(0, 0, 390, 844);
+            BAFloatingButton *btn = [[BAFloatingButton alloc]
+                initWithFrame:CGRectMake(fb.size.width - 48, 160, 32, 32)];
+            BAFloatWin = [[BAPassthroughWindow alloc] initWithFrame:fb];
+            BAFloatWin.windowLevel = UIWindowLevelAlert + 99;
+            BAFloatWin.backgroundColor = [UIColor clearColor];
+            BAFloatWin.hidden = NO;
+            [BAFloatWin addSubview:btn];
+            [BAFloatWin makeKeyAndVisible];
+            BAEssentialLog(@"overlay floating button shown");
+        });
+}
+#endif  // BA_HAS_UI
+
 #pragma mark - 入口
 
 // constructor 里不能用 BAQuery*（它们依赖 ObjC runtime 完全就绪的时序没问题，
@@ -1897,6 +2126,9 @@ static void BiliAccInit(void) {
         });
         // delegate 包装 swizzle：FFPlay 类静态链接于主二进制，构造期即可用
         BAWrapOpenDelegates();
+#if BA_HAS_UI
+        BAShowOverlay();
+#endif
 
         BAEssentialLog(@"loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld, verbose=%d",
               (long)BAProxyPort(), BAMode(), BATargetHost(), (long)BAConcurrency(), BAVerbose());
