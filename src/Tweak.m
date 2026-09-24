@@ -1091,12 +1091,10 @@ static void BABlockInit(void) {
     long long expect = to - from + 1;
     NSInteger attempts = 4;   // 原始主机 + 3 个备用镜像
     for (NSInteger attempt = 0; attempt < attempts; attempt++) {
-        NSString *hostHeader = nil;
+        // 注意：IP 直连实测不可达（B站 DNS 给的 IP 在用户网络全部超时），域名直连 1.9MB/s —— 用域名
         NSURL *u = [self urlWithFallbackHost:real attempt:attempt];
-        u = [self ipDirectURL:u hostHeader:&hostHeader];   // B站 DNS 优选 → IP 直连
         NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u];
         [rq setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", from, to] forHTTPHeaderField:@"Range"];
-        if (hostHeader) [rq setValue:hostHeader forHTTPHeaderField:@"Host"];
         [rq setTimeoutInterval:15];
         __block NSData *d = nil;
         __block NSInteger status = 0;
