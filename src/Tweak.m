@@ -1762,9 +1762,10 @@ static void BAHookSegSetBackups(id self, SEL _cmd, NSArray *urls) {
             if (!u || [u hasPrefix:@"http://127.0.0.1"]) continue;
             NSURL *nu = [NSURL URLWithString:u];
             if (!nu || !BAIsMediaURL(nu) || BAIsLiveMedia(nu)) continue;
-            NSString *reason = nil;
-            NSString *next = BAWrapProxy(BARewriteUrlDetail(u, &reason));
-            if (next && ![next isEqualToString:u]) {
+            // backup 是播放器的逃生通道：只包本地代理、不换主机
+            // （换镜像可能导致 backup 不可达——AV1 冷门文件镜像缺缓存 → 卡死）
+            NSString *next = BAWrapProxy(u);
+            if (![next isEqualToString:u]) {
                 if (!rewritten) {
                     rewritten = [NSMutableArray arrayWithArray:urls];
                 }
@@ -2178,15 +2179,9 @@ static void BAShowOverlay(void) {
             // 不调 makeKeyAndVisible：抢 key 会干扰 App 自己的 responder 链
             // （全屏按钮/横屏手势失效——App 依赖自己的 key window 处理手势优先级）
             // 兜底入口：App 主窗口三击 = 开关面板（不依赖悬浮钮的触摸链）
-            UIWindow *appWin2 = [UIApplication sharedApplication].windows.firstObject;
-            if (appWin2) {
-                UITapGestureRecognizer *tp = [[UITapGestureRecognizer alloc]
-                    initWithTarget:btn action:@selector(tapped)];
-                tp.numberOfTapsRequired = 3;
-                tp.cancelsTouchesInView = NO;   // 不吞掉 App 自己的触摸
-                [appWin2 addGestureRecognizer:tp];
-            }
-            BAEssentialLog(@"overlay floating button shown + triple-tap gesture armed");
+            // 注意：不往 App 主窗口挂手势 —— 会吞掉 B 站全屏按钮的首次触摸
+            // （全屏按钮需要两次点击，三击手势的识别期延迟了 touch 传递）
+            BAEssentialLog(@"overlay floating button shown");
         });
 }
 #endif  // BA_HAS_UI
