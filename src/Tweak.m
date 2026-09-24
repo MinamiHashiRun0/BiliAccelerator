@@ -2095,15 +2095,25 @@ static BADebugPanel *BADebugShared = nil;
 - (void)show {
     UIView *p = [self buildPanel];
     if (!p.superview) {
-        UIWindow *fw = BAFloatWin ?: [UIApplication sharedApplication].windows.firstObject;
-        [fw addSubview:p];
+        // 面板窗口只在点开时创建，尺寸=面板大小（不遮挡 B 站其余交互区域）
+        UIWindow *pw = [[UIWindow alloc] initWithFrame:p.frame];
+        pw.windowLevel = UIWindowLevelAlert + 100;
+        pw.backgroundColor = [UIColor clearColor];
+        pw.hidden = NO;
+        [pw addSubview:p];
+        p.frame = pw.bounds;
+        [pw makeKeyAndVisible];
+        BAFloatWin = pw;   // 复用变量持有面板窗
     }
     [self buildUI];
     p.hidden = NO;
     [self refreshLog];
 }
 
-- (void)hide { if (_panel) _panel.hidden = YES; }
+- (void)hide {
+    if (_panel) _panel.hidden = YES;
+    // 面板窗隐藏时把窗口缩回按钮位？简化：面板窗与按钮窗分离，面板窗仅点开时创建
+}
 - (BOOL)isPanelVisible { return _panel && !_panel.hidden; }
 
 @end
@@ -2150,9 +2160,17 @@ static BADebugPanel *BADebugShared = nil;
     return self;
 }
 - (void)dragged:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self.superview];
-    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
-    [g setTranslation:CGPointZero inView:self.superview];
+    // 窗口即按钮大小：拖动窗口本身
+    UIWindow *w = self.window;
+    CGPoint t = [g translationInView:nil];
+    CGRect f = w.frame;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    CGRect nf = CGRectMake(MIN(MAX(f.origin.x + t.x, 4), sb.size.width - f.size.width - 4),
+                           MIN(MAX(f.origin.y + t.y, 60), sb.size.height - 100),
+                           f.size.width, f.size.height);
+    w.frame = nf;
+    self.frame = w.bounds;
+    [g setTranslation:CGPointZero inView:nil];
 }
 - (void)tapped {
     BAEssentialLog(@"floating button TAPPED (visible=%d)", (int)[BADebugPanel shared].isPanelVisible);
@@ -2169,19 +2187,16 @@ static void BAShowOverlay(void) {
             if (BAFloatWin) return;
             UIWindow *win = [UIApplication sharedApplication].windows.firstObject;
             CGRect fb = win ? win.bounds : CGRectMake(0, 0, 390, 844);
-            BAFloatingButton *btn = [[BAFloatingButton alloc]
-                initWithFrame:CGRectMake(fb.size.width - 48, 160, 32, 32)];
-            BAFloatWin = [[BAPassthroughWindow alloc] initWithFrame:fb];
+            // 关键：窗口就是按钮大小（36x36）—— 全屏大小的透明窗即使 hitTest 穿透，
+            // 也会截获/延迟 B 站全屏按钮的触摸事件（触摸必须先穿过更高层的窗口）
+            CGRect btnFrame = CGRectMake(fb.size.width - 52, 160, 36, 36);
+            BAFloatWin = [[UIWindow alloc] initWithFrame:btnFrame];
             BAFloatWin.windowLevel = UIWindowLevelAlert + 99;
             BAFloatWin.backgroundColor = [UIColor clearColor];
             BAFloatWin.hidden = NO;
+            BAFloatingButton *btn = [[BAFloatingButton alloc] initWithFrame:BAFloatWin.bounds];
             [BAFloatWin addSubview:btn];
-            // 不调 makeKeyAndVisible：抢 key 会干扰 App 自己的 responder 链
-            // （全屏按钮/横屏手势失效——App 依赖自己的 key window 处理手势优先级）
-            // 兜底入口：App 主窗口三击 = 开关面板（不依赖悬浮钮的触摸链）
-            // 注意：不往 App 主窗口挂手势 —— 会吞掉 B 站全屏按钮的首次触摸
-            // （全屏按钮需要两次点击，三击手势的识别期延迟了 touch 传递）
-            BAEssentialLog(@"overlay floating button shown");
+            BAEssentialLog(@"overlay floating button shown (compact window)");
         });
 }
 #endif  // BA_HAS_UI
