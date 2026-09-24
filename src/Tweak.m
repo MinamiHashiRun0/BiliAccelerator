@@ -10,6 +10,7 @@
 #import <dlfcn.h>
 #import <stdlib.h>
 #import <fcntl.h>
+#import <sys/time.h>
 #import <unistd.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
@@ -141,6 +142,16 @@ static void BAApendLog(NSString *msg) {
     if (fd == -2)
         fd = open(path.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd > 0) {
+        // 时间戳前缀（文件日志需要定位耗时/时序）
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        struct tm tmv;
+        localtime_r(&tv.tv_sec, &tmv);
+        char ts[40];
+        snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03ld ",
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (long)(tv.tv_usec / 1000));
+        ssize_t i0 = write(fd, ts, strlen(ts));
+        (void)i0;
         const char *s = [msg UTF8String];
         if (s) { ssize_t ignore = write(fd, s, strlen(s)); (void)ignore; }
         ssize_t ignore2 = write(fd, "\n", 1); (void)ignore2;
