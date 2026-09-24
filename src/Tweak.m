@@ -1731,6 +1731,73 @@ static void BAWrapOpenDelegates(void) {
     }
 }
 
+// ============ 最终模型层改写（根治）============
+// IJKMediaAssetStreamSegment 是播放器消费 URL 的最终模型——无论 playurl 从哪条
+// API 路径来（PlayViewUnite / PlayView / pgc / 预取缓存），URL 都在这里实例化。
+// hook initWithUrl: 保证任何拷贝时机下的改写都能落地（reply 层是竞速，这层是必经）。
+static IMP BAOrigSegmentInit = NULL;
+static id BAHookSegmentInit(id self, SEL _cmd, NSString *url) {
+    NSString *u = url;
+    if (u && BAEnabled() && ![u hasPrefix:@"http://127.0.0.1"]) {
+        NSURL *nu = [NSURL URLWithString:u];
+        if (nu && BAIsMediaURL(nu) && !BAIsLiveMedia(nu)) {
+            NSString *reason = nil;
+            NSString *next = BAWrapProxy(BARewriteUrlDetail(u, &reason));
+            if (next && ![next isEqualToString:u]) {
+                BAEssentialLog(@"segment-init rewrite → %s", next.UTF8String);
+                u = next;
+            }
+        }
+    }
+    return ((id (*)(id, SEL, NSString *))BAOrigSegmentInit)(self, _cmd, u);
+}
+
+static IMP BAOrigSegSetBackups = NULL;
+static void BAHookSegSetBackups(id self, SEL _cmd, NSArray *urls) {
+    if (urls && BAEnabled()) {
+        NSMutableArray *rewritten = nil;
+        for (id obj in urls) {
+            NSString *u = [obj isKindOfClass:[NSString class]] ? obj :
+                          ([obj isKindOfClass:[NSURL class]] ? [obj absoluteString] : nil);
+            if (!u || [u hasPrefix:@"http://127.0.0.1"]) continue;
+            NSURL *nu = [NSURL URLWithString:u];
+            if (!nu || !BAIsMediaURL(nu) || BAIsLiveMedia(nu)) continue;
+            NSString *reason = nil;
+            NSString *next = BAWrapProxy(BARewriteUrlDetail(u, &reason));
+            if (next && ![next isEqualToString:u]) {
+                if (!rewritten) {
+                    rewritten = [NSMutableArray arrayWithArray:urls];
+                }
+                NSUInteger idx = [rewritten indexOfObject:obj];
+                if (idx != NSNotFound) [rewritten replaceObjectAtIndex:idx withObject:next];
+            }
+        }
+        if (rewritten) {
+            ((void (*)(id, SEL, NSArray *))BAOrigSegSetBackups)(self, _cmd, rewritten);
+            return;
+        }
+    }
+    if (BAOrigSegSetBackups)
+        ((void (*)(id, SEL, NSArray *))BAOrigSegSetBackups)(self, _cmd, urls);
+}
+
+static void BAWrapSegmentModel(void) {
+    Class c = objc_getClass("IJKMediaAssetStreamSegment");
+    if (!c) { BAEssentialLog(@"segment-model: class not found"); return; }
+    Method m1 = class_getInstanceMethod(c, @selector(initWithUrl:));
+    if (m1 && !BAOrigSegmentInit) {
+        BAOrigSegmentInit = method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)BAHookSegmentInit);
+        BAEssentialLog(@"segment-model: initWithUrl: hooked");
+    }
+    Method m2 = class_getInstanceMethod(c, @selector(setBackupUrls:));
+    if (m2 && !BAOrigSegSetBackups) {
+        BAOrigSegSetBackups = method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)BAHookSegSetBackups);
+        BAEssentialLog(@"segment-model: setBackupUrls: hooked");
+    }
+}
+
 static void BAHookGrpcModels(void) {
     // AVURLAsset（AVPlayer 引擎）诊断 hook
     if (!BAOrigAVURLAssetInit) {
@@ -2108,13 +2175,15 @@ static void BAShowOverlay(void) {
             BAFloatWin.backgroundColor = [UIColor clearColor];
             BAFloatWin.hidden = NO;
             [BAFloatWin addSubview:btn];
-            [BAFloatWin makeKeyAndVisible];
+            // 不调 makeKeyAndVisible：抢 key 会干扰 App 自己的 responder 链
+            // （全屏按钮/横屏手势失效——App 依赖自己的 key window 处理手势优先级）
             // 兜底入口：App 主窗口三击 = 开关面板（不依赖悬浮钮的触摸链）
             UIWindow *appWin2 = [UIApplication sharedApplication].windows.firstObject;
             if (appWin2) {
                 UITapGestureRecognizer *tp = [[UITapGestureRecognizer alloc]
                     initWithTarget:btn action:@selector(tapped)];
                 tp.numberOfTapsRequired = 3;
+                tp.cancelsTouchesInView = NO;   // 不吞掉 App 自己的触摸
                 [appWin2 addGestureRecognizer:tp];
             }
             BAEssentialLog(@"overlay floating button shown + triple-tap gesture armed");
@@ -2161,6 +2230,8 @@ static void BiliAccInit(void) {
         });
         // delegate 包装 swizzle：FFPlay 类静态链接于主二进制，构造期即可用
         BAWrapOpenDelegates();
+        // 最终模型层改写（IJKMediaAssetStreamSegment）——URL 消费的必经点
+        BAWrapSegmentModel();
 #if BA_HAS_UI
         BAShowOverlay();
 #ifdef BA_AUTO_PANEL
