@@ -1877,7 +1877,7 @@ static void BAPrefSet(NSString *key, id v) {
 - (void)hide;
 @end
 
-static UIWindow *BAOverlayWin = nil;
+static UIWindow *BAFloatWin = nil;
 static BADebugPanel *BADebugShared = nil;
 
 @implementation BADebugPanel {
@@ -1894,26 +1894,24 @@ static BADebugPanel *BADebugShared = nil;
     return BADebugShared;
 }
 
-- (UIWindow *)ensureWindow {
-    if (BAOverlayWin) return BAOverlayWin;
+// 面板视图直接挂到悬浮窗（BAPassthroughWindow 同窗），居中显示
+- (UIView *)buildPanel {
+    if (_panel) return _panel;
     UIWindow *appWin = [UIApplication sharedApplication].windows.firstObject;
     CGFloat aw = appWin ? appWin.bounds.size.width : 390;
-    BAOverlayWin = [[UIWindow alloc]
-        initWithFrame:CGRectMake(MAX(10, (aw - 320) / 2), 120, 320, 420)];
-    BAOverlayWin.windowLevel = UIWindowLevelAlert + 100;
-    BAOverlayWin.hidden = YES;
-    BAOverlayWin.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
-    BAOverlayWin.layer.cornerRadius = 12;
-    BAOverlayWin.layer.masksToBounds = YES;
-    _panel = [[UIView alloc] initWithFrame:BAOverlayWin.bounds];
-    _panel.backgroundColor = [UIColor clearColor];
-    [BAOverlayWin addSubview:_panel];
-    return BAOverlayWin;
+    CGFloat ah = appWin ? appWin.bounds.size.height : 844;
+    CGFloat pw = aw - 24, ph = MIN(460, ah - 160);
+    _panel = [[UIView alloc] initWithFrame:CGRectMake((aw - pw) / 2, (ah - ph) / 2 - 40, pw, ph)];
+    _panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.97];
+    _panel.layer.cornerRadius = 14;
+    _panel.layer.masksToBounds = YES;
+    _panel.hidden = YES;
+    return _panel;
 }
 
 - (void)buildUI {
-    UIWindow *w = [self ensureWindow];
-    if (_panel && _panel.superview) return;   // 只构建一次
+    UIView *w = [self buildPanel];
+    if (_swEnabled) return;   // 只构建一次
     CGFloat wpx = w.bounds.size.width, x = 12, cw = wpx - 24;
     CGFloat y = 8;
 
@@ -1995,7 +1993,7 @@ static BADebugPanel *BADebugShared = nil;
 }
 
 - (void)refreshLog {
-    if (!BAOverlayWin || BAOverlayWin.hidden || !_logView) return;
+    if (!_logView || _panel.hidden) return;
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"BiliAcc.log"];
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
     if (!fh) return;
@@ -2016,12 +2014,18 @@ static BADebugPanel *BADebugShared = nil;
 }
 
 - (void)show {
+    UIView *p = [self buildPanel];
+    if (!p.superview) {
+        UIWindow *fw = BAFloatWin ?: [UIApplication sharedApplication].windows.firstObject;
+        [fw addSubview:p];
+    }
     [self buildUI];
-    BAOverlayWin.hidden = NO;
-    [BAOverlayWin makeKeyAndVisible];
+    p.hidden = NO;
+    [self refreshLog];
 }
 
-- (void)hide { if (BAOverlayWin) BAOverlayWin.hidden = YES; }
+- (void)hide { if (_panel) _panel.hidden = YES; }
+- (BOOL)isPanelVisible { return _panel && !_panel.hidden; }
 
 @end
 
@@ -2063,13 +2067,11 @@ static BADebugPanel *BADebugShared = nil;
     [g setTranslation:CGPointZero inView:self.superview];
 }
 - (void)tapped {
-    UIWindow *ov = BAOverlayWin;
-    if (ov && !ov.hidden) [[BADebugPanel shared] hide];
-    else [[BADebugPanel shared] show];
+    BADebugPanel *p = [BADebugPanel shared];
+    if ([p isPanelVisible]) [p hide];
+    else [p show];
 }
 @end
-
-static UIWindow *BAFloatWin = nil;
 
 static void BAShowOverlay(void) {
     if (!BAEnabled()) return;
@@ -2132,6 +2134,10 @@ static void BiliAccInit(void) {
         BAWrapOpenDelegates();
 #if BA_HAS_UI
         BAShowOverlay();
+#ifdef BA_AUTO_PANEL
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{ [[BADebugPanel shared] show]; });
+#endif
 #endif
 
         BAEssentialLog(@"loaded, proxy on 127.0.0.1:%ld, mode=%@, target=%@, lanes=%ld, verbose=%d",
