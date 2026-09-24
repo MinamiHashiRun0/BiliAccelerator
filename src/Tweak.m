@@ -1320,8 +1320,12 @@ static void BAServeConnection(int conn) {
             BAEssentialLog(@"seg req: Range=%s (from=%lld to=%lld)",
                 (rangeHeader ?: @"(none)").UTF8String, reqFrom, reqTo);
             if (rangeReq && reqFrom >= 0) {
-                long long total = [BABackend totalForURL:inner];
-                body = [BABackend serveRange:inner from:reqFrom to:reqTo total:total];
+                long long win = reqTo - reqFrom + 1;
+                // 小窗口（≤384KB）走对齐块缓存（含预取）；大窗口走 6 路并发切片
+                if (win <= 384 * 1024) {
+                    long long total = [BABackend totalForURL:inner];
+                    body = [BABackend serveRange:inner from:reqFrom to:reqTo total:total];
+                }
             }
             if (!body) {
                 body = [BABackend handleVideoSegment:inner reqFrom:reqFrom reqTo:reqTo
