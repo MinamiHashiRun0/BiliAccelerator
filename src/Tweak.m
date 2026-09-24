@@ -1896,7 +1896,10 @@ static BADebugPanel *BADebugShared = nil;
 
 - (UIWindow *)ensureWindow {
     if (BAOverlayWin) return BAOverlayWin;
-    BAOverlayWin = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 320, 420)];
+    UIWindow *appWin = [UIApplication sharedApplication].windows.firstObject;
+    CGFloat aw = appWin ? appWin.bounds.size.width : 390;
+    BAOverlayWin = [[UIWindow alloc]
+        initWithFrame:CGRectMake(MAX(10, (aw - 320) / 2), 120, 320, 420)];
     BAOverlayWin.windowLevel = UIWindowLevelAlert + 100;
     BAOverlayWin.hidden = YES;
     BAOverlayWin.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
@@ -2026,8 +2029,9 @@ static BADebugPanel *BADebugShared = nil;
 @implementation BAPassthroughWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    // 落在窗口自身/根视图背景上 → 穿透给 App；落在按钮上 → 正常接收
-    return (hit == self || hit == self.subviews.firstObject) ? nil : hit;
+    // 空白区域时 super 返回窗口自身 → 穿透给 App；落在子视图（按钮）上 → 正常接收
+    if (hit == self || hit == nil) return nil;
+    return hit;
 }
 @end
 
