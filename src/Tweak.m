@@ -698,7 +698,9 @@ static NSData *BARewriteProtobufBody(NSData *payload, BOOL *changed) {
 @interface BAProxy : NSObject
 - (NSURL *)innerURLFor:(NSString *)query;
 - (long long)totalForURL:(NSURL *)url;   // 带缓存的总大小探测（失败返回 -1）
-- (NSData *)cachedPayloadForKey:(NSString *)key;
+- (NSURLSession *)dnsSession;   // 清空 protocolClasses 的会话（DNS 查询专用）
+- (NSURL *)ipDirectURL:(NSURL *)url hostHeader:(NSString **)hostHeader;   // B站自建DNS优选 → IP直连
+#define BA_BLOCK_BYTES (262144LL)        // 256KB 对齐块
 - (void)storePayload:(NSData *)d forKey:(NSString *)key;
 - (NSData *)blockFor:(NSURL *)url index:(long long)idx blockBytes:(long long)B total:(long long)total;
 - (NSData *)serveRange:(NSURL *)url from:(long long)from to:(long long)to total:(long long)total;
@@ -796,6 +798,96 @@ static BAProxy *BABackend = nil;
 #define BA_BLOCK_BYTES (262144LL)        // 256KB 对齐块
 #define BA_BLOCK_CACHE_MAX_BLOCKS 192     // ~48MB
 
+// ============ IP 直连（HAR 抓包证实：B 站原生用自建 DNS 优选 IP 后 IP 直连）============
+// 系统 DNS 把 akamaized.net 解析到海外节点 → 19KB/s；B 站自建 DNS 给国内可达 IP → 30MB/s。
+// 优选后请求 IP 直连 + Host 头保留原域名。
+static NSMutableDictionary *BAIpCache;   // host → ip（B站 DNS，60~600s ttl）
+static NSLock *BAIpLock;
+
+static void BAIpInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        BAIpCache = [NSMutableDictionary dictionary];
+        BAIpLock = [NSLock new];
+    });
+}
+
+// DNS 查询专用会话（全局 C 接口，清空 protocolClasses 防 B 站 P2P 劫持）
+static NSURLSession *BADnsSessionShared(void) {
+    static NSURLSession *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+        cfg.protocolClasses = nil;
+        cfg.connectionProxyDictionary = @{};
+        cfg.timeoutIntervalForRequest = 20;
+        s = [NSURLSession sessionWithConfiguration:cfg delegate:nil delegateQueue:nil];
+    });
+    return s;
+}
+
+// 询问 B 站自建 DNS（同步，20s 超时；失败返回 nil 走系统 DNS）
+static NSString *BAQueryBiliDns(NSString *host) {
+    NSString *api = [NSString stringWithFormat:
+        @"http://203.119.238.240/191607/resolve?host=%@&query=4", host];
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:api]];
+    rq.timeoutInterval = 20;
+    __block NSData *d = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSession *dnsS = BADnsSessionShared();
+    [[dnsS dataTaskWithRequest:rq
+        completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+            d = data; dispatch_semaphore_signal(sem);
+        }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 21LL * NSEC_PER_SEC));
+    if (!d) return nil;
+    id json = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    NSArray *dns = json[@"dns"];
+    for (NSDictionary *item in dns) {
+        if ([item[@"host"] isEqualToString:host]) {
+            NSArray *ips = item[@"ips"];
+            if (ips.count) return ips.firstObject;
+            // 无 ips 说明 CNAME 未展开/海外域名 → 走 client_ip
+            NSString *cip = item[@"client_ip"];
+            if (cip.length) return cip;
+        }
+    }
+    return nil;
+}
+
+// 返回 IP 直连 URL（path/query 不变，host 换成优选 IP）；hostHeader 传出应设置的 Host 头
+- (NSURL *)ipDirectURL:(NSURL *)url hostHeader:(NSString **)hostHeader {
+    if (!url.host) return url;
+    if (!BAIpLock) BAIpInit();
+    NSString *origHost = url.host;
+    // 已经是 IP 直连
+    struct in_addr tmp;
+    if (inet_pton(AF_INET, origHost.UTF8String, &tmp) == 1) return url;
+
+    BAIpLock;
+    NSString *ip = BAIpCache[origHost];
+    [BAIpLock unlock];
+    if (!ip) {
+        ip = BAQueryBiliDns(origHost) ?: @"";
+        BAIpLock;
+        if (ip.length) BAIpCache[origHost] = ip;
+        [BAIpLock unlock];
+        BAEssentialLog(@"ip-direct: %@ -> %@", origHost, ip.length ? ip : @"(fail, use system dns)");
+    }
+    if (!ip.length) return url;   // DNS 失败，保持原样
+
+    if (hostHeader) *hostHeader = origHost;
+    NSURLComponents *c = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    if (!c) return url;
+    c.host = ip;
+    if ([c.scheme isEqualToString:@"https"]) {
+        // IP 直连 https 无法验证证书——退回 http（B 站 CDN 均支持 http）
+        c.scheme = @"http";
+    }
+    return c.URL;
+}
+
+
 static NSMutableDictionary *BABlockCache;   // key: "url|blk|<idx>"
 static NSMutableArray *BABlockOrder;
 static NSMutableDictionary *BABlockInflight;
@@ -847,7 +939,7 @@ static void BABlockInit(void) {
     BABlockInflight[key] = @(YES);
     [BABlockLock unlock];
 
-    NSData *d = [self fetchRange:url from:a to:b lane:0];
+    NSData *d = [self fetchRange:url from:a to:b lane:(NSInteger)(idx % 8)];
     BOOL ok = d && (long long)d.length == expect;
     BABlockLock;
     [BABlockInflight removeObjectForKey:key];
@@ -885,12 +977,30 @@ static void BABlockInit(void) {
     return out;
 }
 
+// 流水线并发预取：N+1..N+lanes 全部同时拉（各 lane 并行）——
+// 播放器是串行读，命中预取零等待；预取吞吐 = lanes × 单连接速度
 - (void)prefetchBlocks:(NSURL *)url startIndex:(long long)idx count:(NSInteger)n blockBytes:(long long)B total:(long long)total {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         for (NSInteger k = 0; k < n; k++) {
             long long i = idx + k;
             if (total > 0 && i * B > total - 1) return;
-            [self blockFor:url index:i blockBytes:B total:total];
+            // 每块用不同 lane 的 session（复用 _sessions 的并行 TCP 连接）
+            NSData *d = [self fetchRange:url
+                                    from:i * B
+                                      to:MIN(i * B + B - 1, total > 0 ? total - 1 : i * B + B - 1)
+                                    lane:(NSInteger)(i % 8)];
+            if (d) {
+                NSString *key = [NSString stringWithFormat:@"%@|blk|%lld", url.absoluteString, i];
+                [self storePayload:d forKey:key];
+                [BABlockLock lock];
+                [BABlockOrder addObject:key];
+                while (BABlockOrder.count > BA_BLOCK_CACHE_MAX_BLOCKS) {
+                    NSString *old = BABlockOrder.firstObject;
+                    [BABlockOrder removeObjectAtIndex:0];
+                    [BABlockCache removeObjectForKey:old];
+                }
+                [BABlockLock unlock];
+            }
         }
     });
 }
@@ -981,9 +1091,12 @@ static void BABlockInit(void) {
     long long expect = to - from + 1;
     NSInteger attempts = 4;   // 原始主机 + 3 个备用镜像
     for (NSInteger attempt = 0; attempt < attempts; attempt++) {
+        NSString *hostHeader = nil;
         NSURL *u = [self urlWithFallbackHost:real attempt:attempt];
+        u = [self ipDirectURL:u hostHeader:&hostHeader];   // B站 DNS 优选 → IP 直连
         NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u];
         [rq setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", from, to] forHTTPHeaderField:@"Range"];
+        if (hostHeader) [rq setValue:hostHeader forHTTPHeaderField:@"Host"];
         [rq setTimeoutInterval:15];
         __block NSData *d = nil;
         __block NSInteger status = 0;
