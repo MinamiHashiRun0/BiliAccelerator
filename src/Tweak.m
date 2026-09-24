@@ -1956,7 +1956,8 @@ static void BAPrefSet(NSString *key, id v) {
 - (void)hide;
 @end
 
-static UIWindow *BAFloatWin = nil;
+static UIWindow *BAFloatWin = nil;   // 悬浮小球窗（36x36）
+static UIWindow *BAPanelWin = nil;   // 面板窗（点开时创建）
 static BADebugPanel *BADebugShared = nil;
 
 @implementation BADebugPanel {
@@ -2095,24 +2096,26 @@ static BADebugPanel *BADebugShared = nil;
 - (void)show {
     UIView *p = [self buildPanel];
     if (!p.superview) {
-        // 面板窗口只在点开时创建，尺寸=面板大小（不遮挡 B 站其余交互区域）
+        // 面板窗口独立创建（不覆盖按钮窗），尺寸=面板大小
         UIWindow *pw = [[UIWindow alloc] initWithFrame:p.frame];
         pw.windowLevel = UIWindowLevelAlert + 100;
-        pw.backgroundColor = [UIColor clearColor];
+        pw.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.97];
+        pw.layer.cornerRadius = 14;
+        pw.layer.masksToBounds = YES;
         pw.hidden = NO;
         [pw addSubview:p];
         p.frame = pw.bounds;
-        [pw makeKeyAndVisible];
-        BAFloatWin = pw;   // 复用变量持有面板窗
+        // 不 makeKeyAndVisible：成为 key window 会拦截 B 站全部触摸
+        BAPanelWin = pw;
     }
     [self buildUI];
-    p.hidden = NO;
+    BAPanelWin.hidden = NO;
     [self refreshLog];
 }
 
 - (void)hide {
     if (_panel) _panel.hidden = YES;
-    // 面板窗隐藏时把窗口缩回按钮位？简化：面板窗与按钮窗分离，面板窗仅点开时创建
+    if (BAPanelWin) BAPanelWin.hidden = YES;   // 整窗隐藏，触摸还给 B 站
 }
 - (BOOL)isPanelVisible { return _panel && !_panel.hidden; }
 
@@ -2162,8 +2165,12 @@ static BADebugPanel *BADebugShared = nil;
 - (void)tapped {
     BAEssentialLog(@"floating button TAPPED (visible=%d)", (int)[BADebugPanel shared].isPanelVisible);
     BADebugPanel *p = [BADebugPanel shared];
-    if ([p isPanelVisible]) [p hide];
-    else [p show];
+    if ([p isPanelVisible]) {
+        [p hide];
+        BAPanelWin.hidden = YES;
+    } else {
+        [p show];
+    }
 }
 @end
 
