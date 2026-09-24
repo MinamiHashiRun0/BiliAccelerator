@@ -1216,8 +1216,8 @@ static BOOL BAParseRange(NSString *rangeHeader, long long *from, long long *to) 
     // 把窗口均分成 lanes 段（尾段余量并入最后一段）
     long long slice = (windowSize + lanes - 1) / lanes;
     NSInteger nseg = (NSInteger)((windowSize + slice - 1) / slice);
-    BAEssentialLog(@"seg: window %lld-%lld (%lldMB) → %ld slices, %lldKB each",
-          reqFrom, reqTo, windowSize / 1024 / 1024, (long)nseg, slice / 1024);
+    BAEssentialLog(@"seg: window %lld-%lld (%lldKB) → %ld slices, %lldKB each",
+          reqFrom, reqTo, windowSize / 1024, (long)nseg, slice / 1024);
 
     NSMutableArray<NSData *> *buffers = [NSMutableArray arrayWithCapacity:(NSUInteger)nseg];
     for (NSInteger i = 0; i < nseg; i++) [buffers addObject:[NSNull null]];
