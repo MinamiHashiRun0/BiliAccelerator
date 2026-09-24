@@ -2110,6 +2110,7 @@ static BADebugPanel *BADebugShared = nil;
     }
     [self buildUI];
     BAPanelWin.hidden = NO;
+    p.hidden = NO;          // ← 遗漏的一行：视图本体也要取消隐藏（此前只开了窗）
     [self refreshLog];
 }
 
