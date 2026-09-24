@@ -2029,12 +2029,21 @@ static BADebugPanel *BADebugShared = nil;
 
 @end
 
+@class BAFloatingButton;
 @interface BAPassthroughWindow : UIWindow @end
-@implementation BAPassthroughWindow
+@implementation BAPassthroughWindow {
+    NSDate *_lastHitLog;
+}
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     // 空白区域时 super 返回窗口自身 → 穿透给 App；落在子视图（按钮）上 → 正常接收
     if (hit == self || hit == nil) return nil;
+    if ([NSStringFromClass([hit class]) isEqualToString:@"BAFloatingButton"]
+        && (!_lastHitLog || -[_lastHitLog timeIntervalSinceNow] > 2)) {
+        _lastHitLog = [NSDate date];
+        BAEssentialLog(@"passthrough hit: floating button (window %@)",
+            self.hidden ? @"hidden" : @"visible");
+    }
     return hit;
 }
 @end
@@ -2067,6 +2076,7 @@ static BADebugPanel *BADebugShared = nil;
     [g setTranslation:CGPointZero inView:self.superview];
 }
 - (void)tapped {
+    BAEssentialLog(@"floating button TAPPED (visible=%d)", (int)[BADebugPanel shared].isPanelVisible);
     BADebugPanel *p = [BADebugPanel shared];
     if ([p isPanelVisible]) [p hide];
     else [p show];
@@ -2088,7 +2098,15 @@ static void BAShowOverlay(void) {
             BAFloatWin.hidden = NO;
             [BAFloatWin addSubview:btn];
             [BAFloatWin makeKeyAndVisible];
-            BAEssentialLog(@"overlay floating button shown");
+            // 兜底入口：App 主窗口三击 = 开关面板（不依赖悬浮钮的触摸链）
+            UIWindow *appWin2 = [UIApplication sharedApplication].windows.firstObject;
+            if (appWin2) {
+                UITapGestureRecognizer *tp = [[UITapGestureRecognizer alloc]
+                    initWithTarget:btn action:@selector(tapped)];
+                tp.numberOfTapsRequired = 3;
+                [appWin2 addGestureRecognizer:tp];
+            }
+            BAEssentialLog(@"overlay floating button shown + triple-tap gesture armed");
         });
 }
 #endif  // BA_HAS_UI
